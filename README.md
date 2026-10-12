@@ -1,6 +1,6 @@
 # excalidraw-axi
 
-Agent-ergonomic CLI for Excalidraw diagrams. File-first `.excalidraw` operations with token-efficient output, following [AXI](https://axi.md/) principles.
+Agent-ergonomic CLI for **drawing in Excalidraw**. File-first `.excalidraw` operations with token-efficient output, following [AXI](https://axi.md/) principles.
 
 > No `excalidraw-axi` existed in the [AXI catalog](https://axi.md/) — this is the first.
 
@@ -9,45 +9,83 @@ Agent-ergonomic CLI for Excalidraw diagrams. File-first `.excalidraw` operations
 ```sh
 npm install -g github:nahidupa/excalidraw-axi
 # or run without installing:
-npx github:nahidupa/excalidraw-axi list
+npx github:nahidupa/excalidraw-axi --help
 ```
 
 Requires Node >= 18. Zero runtime dependencies. The `export` command fetches `@moona3k/excalidraw-export` on demand via `npx`.
 
-## Usage
+## Draw
+
+Three paths, fastest first:
 
 ```sh
-excalidraw-axi                          # home view: scenes in cwd + next steps
-excalidraw-axi list [dir]               # list .excalidraw scenes
-excalidraw-axi view <file> [--full]     # scene summary (truncated unless --full)
-excalidraw-axi validate <file>          # schema check (exit 1 if invalid)
-excalidraw-axi create -o s.excalidraw --title "My diagram"
+# 1. Spec -> diagram with auto-layout (best for agents: no coordinates)
+excalidraw-axi create --spec diagram.json -o arch.excalidraw
+
+# 2. Mermaid flowchart -> diagram (TD,TB,LR,RL,BT subset)
+excalidraw-axi create --mermaid-file flow.mmd -o flow.excalidraw
+
+# 3. Shape by shape (explicit geometry or auto-place below content)
+excalidraw-axi add arch.excalidraw rectangle --label "API"
+excalidraw-axi add arch.excalidraw text --text "notes" --x 100 --y 600
+excalidraw-axi add arch.excalidraw arrow --from <id-a> --to <id-b> --label "calls"
+```
+
+Spec format (`diagram.json`):
+
+```json
+{
+  "layout": "row",
+  "nodes": [
+    { "id": "user", "label": "User", "shape": "ellipse" },
+    { "id": "api", "label": "API server" },
+    { "id": "db", "label": "Postgres?", "shape": "diamond" }
+  ],
+  "edges": [
+    { "from": "user", "to": "api", "label": "HTTPS" },
+    { "from": "api", "to": "db", "label": "queries" }
+  ]
+}
+```
+
+* `layout`: `row` (flow right) | `column` (flow down) | `grid`
+* `shape`: `rectangle` (default) | `ellipse` | `diamond` | `text`
+* `id` optional — slugified from label when omitted.
+
+Mermaid subset: `graph`/`flowchart` with `TD,TB,LR,RL,BT`; `[box]`, `(rounded)`, `{decision}`→diamond, `((circle))`→ellipse; `-->`, `---`, `==>`, `--o`, `--x`, `-.->` edges; `|labels|`; `A-->B-->C` chains. Other diagram types (sequence, class, …) fail with a clear error instead of a wrong drawing.
+
+## Inspect / edit / render
+
+```sh
+excalidraw-axi list [dir]                # scenes with live element counts
+excalidraw-axi view <file> [--full]      # version, byType counts, first 15 elements
+excalidraw-axi get <file> <id> [--full]  # one element as JSON
+excalidraw-axi validate <file>           # schema check (exit 1 if invalid)
+excalidraw-axi move <file> <id> --dx 0 --dy 60
+excalidraw-axi delete <file> <id...>     # soft-delete (isDeleted)
+excalidraw-axi clear <file>              # remove all elements
 excalidraw-axi export <file> --svg [-o out] [--scale N]
 ```
 
-Example:
+Example session:
 
 ```sh
-$ excalidraw-axi create -o arch.excalidraw --title "API -> DB"
+$ excalidraw-axi create --spec diagram.json -o arch.excalidraw
 created: arch.excalidraw
-elements: 2
+elements: 9
+layout: spec: 3 nodes, 2 edges (row)
 help[2]:
   Run `excalidraw-axi view arch.excalidraw`
   Run `excalidraw-axi export arch.excalidraw --svg`
-
-$ excalidraw-axi view arch.excalidraw
-file: arch.excalidraw
-version: 2
-elements: 2
-byType: text=1, rectangle=1
-viewBackgroundColor: #ffffff
-items[2]{id,type,x,y,w,h,text}:
-  9f31…,text,100,80,132,30,API -> DB
-  44ab…,rectangle,100,140,400,220,-
-help[2]:
-  Run `excalidraw-axi validate <file>`
-  Run `excalidraw-axi export <file> --svg`
 ```
+
+Notes:
+
+* `add` without `--x/--y` auto-places below existing content.
+* `--from/--to` arrows bind to both shapes (recorded in `boundElements`).
+* Edge/shape labels are midpoint text elements (unbound).
+* `move` does not drag attached arrows — re-add them if needed.
+* Unknown flags/commands fail loud (exit 2); validation failures exit 1.
 
 ## AXI principles applied
 
@@ -55,7 +93,7 @@ help[2]:
 |---|---|
 | Token-efficient output | TOON-style `items[n]{fields}:` rows, 3–4 fields by default |
 | Minimal schemas | `list` shows file/elements/bytes only |
-| Truncation | Long text cut at 200 chars with `--full` escape hatch |
+| Truncation | Long text cut at 200 chars (`get` JSON at 2000) with `--full` escape hatch |
 | Aggregates | `elements`, `byType` counts up front |
 | Empty states | Explicit `(no .excalidraw files…)`, `(empty scene…)` |
 | Errors | Structured `error: …` on stdout, exit 1; unknown flag/command exit 2 |
@@ -69,13 +107,13 @@ help[2]:
 * AI drawing: [`excalidraw/excalidraw-mcp`](https://github.com/excalidraw/excalidraw-mcp) (`https://mcp.excalidraw.com`), Excalidraw+ MCP, `yctimlin/mcp_excalidraw`
 * Rendering backend used by `export`: [`@moona3k/excalidraw-export`](https://www.npmjs.com/package/@moona3k/excalidraw-export)
 
-This CLI is the file-side complement: agents create/inspect/validate scenes locally, render them in CI, and hand them to any of the above for live editing.
+This CLI is the deterministic file-side complement: agents describe diagrams as specs/mermaid, get valid scenes with bound arrows, and render them in CI — no pixel-clicking the canvas.
 
 ## Roadmap
 
-* `create --mermaid-file` auto-layout (currently embeds source as text; needs browser-DOM libs)
+* Full mermaid auto-layout beyond flowcharts (needs browser-DOM libs)
 * `--fields` selector for list/view
-* Live-canvas sync mode against local Docker (`:5001`) / `mcp_excalidraw` server
+* Live-canvas sync mode against local Docker / `mcp_excalidraw` server
 * AXI catalog PR once stable
 
 ## License
