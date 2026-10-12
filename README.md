@@ -35,6 +35,12 @@ excalidraw-axi add arch.excalidraw frame --label "F"   # image --file a.png | em
 
 Style flags for `add`: `--stroke #hex --background #hex --stroke-width N --stroke-style solid|dashed|dotted --fill-style solid|hachure|cross-hatch|dots|zigzag --roundness sharp|round --angle N --roughness 0..2 --opacity 0..100 --font-family 1..5 --text-align left|center|right --locked --link <url> --frame <frame-id> --arrow-type sharp|round` (arrows). Text keeps stroke/font/align/link/lock only.
 
+Arrowheads (arrow kind only): `--start-arrowhead/--end-arrowhead none|arrow|triangle|triangle_outline|diamond|diamond_outline|circle|circle_outline|bar`. `--elbow` routes a 2-endpoint arrow orthogonally (the app stores elbow corners explicitly — there is no auto-route on load, so the CLI computes the corner).
+
+Labels: `--label` binds the text **inside** the shape (`containerId` + `boundElements`) — it moves/resizes with the container and survives human edits. `--unbound` keeps the legacy overlay text. Edge labels stay midpoint text (arrows are not containers). `move`/`align`/`distribute`/`flip` drag bound labels along; `delete` repairs references; `duplicate` remaps them.
+
+Images: `--file` embeds the raster as dataURL in `files[]` (png|jpg|jpeg|webp|gif). Aspect is preserved — an explicit `--w` or `--h` scales the other side, otherwise intrinsic size (capped at 1000px). Identical bytes share one `files[]` entry. Live-tab note: this app build resolves images on `#url=` load only for single-image scenes; with 2+ images the tab may show placeholders (export/`validate` are unaffected — `sync` warns).
+
 Spec format (`diagram.json`):
 
 ```json
@@ -89,7 +95,22 @@ excalidraw-axi open <file> [--url U] [--no-launch]  # serve + launch the link in
 excalidraw-axi sync <file> [--url U]                # serve + verify load via chrome-devtools-axi
 ```
 
-`serve`/`open` run until Ctrl+C (the server re-reads the file per request, so edit → reload works). `sync` exits 0 after verifying the canvas element count matches the file, 1 otherwise. `sync` needs the `chrome-devtools-axi` helper on PATH; without it, use `open`.
+`serve`/`open` run until Ctrl+C (the server re-reads the file per request, so edit → reload works). `sync` exits 0 after verifying the canvas element count matches the file, 1 otherwise. `sync` needs the `chrome-devtools-axi` helper on PATH; without it, use `open`. `sync` pre-seeds image bytes into tab storage (the `#url=` loader ignores `scene.files`).
+
+## Read back (pull) and libraries
+
+```sh
+excalidraw-axi pull live.excalidraw [--url http://localhost:5001]
+# read the live tab back: elements+appState from storage, image bytes from
+# tab storage (chunked). Unresolvable images are kept as elements + reported.
+excalidraw-axi pull live.excalidraw --from-url <scene-url|#url=-link>
+# fetch a scene file without a browser
+excalidraw-axi lib push shapes.lib scene.excalidraw <id...> [--name T]
+excalidraw-axi lib list shapes.lib
+excalidraw-axi lib unpack shapes.lib <item-id> scene.excalidraw [--dx N --dy N]
+```
+
+Round-trip an existing drawing: `pull` → `add`/`move`/… → `validate` → `sync`. (Live-tab selection is not readable — the app doesn't persist it — so `pull` grabs the whole canvas.)
 
 Example session:
 
@@ -108,7 +129,7 @@ Notes:
 * `add` without `--x/--y` auto-places below existing content.
 * `--from/--to` arrows bind to both shapes (recorded in `boundElements`).
 * Edge/shape labels are midpoint text elements (unbound).
-* `move` drags arrows bound on every end to the moved set; partially-bound arrows are reported left-behind (re-add those).
+* `move` drags arrows bound on every end to the moved set, plus bound labels; partially-bound arrows are reported left-behind (re-add those).
 * `image` embeds the raster as a dataURL in `files[]` (png|jpg|jpeg|webp|gif).
 * `embed` stores the URL in `link`; the app renders inline only allowlisted hosts (youtube/vimeo/codesandbox/…) — elsewhere it shows as a link.
 * No sticky type exists in OSS Excalidraw — use rectangle+text. Laser is a pointer tool and Text-to-diagram/Mermaid-to-Excalidraw/Wireframe-to-code are Excalidraw+ AI features: no CLI equivalent.

@@ -20,7 +20,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { createServer } from "node:http";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const TRUNCATE_AT = 200;
 const JSON_TRUNCATE_AT = 2000;
 
@@ -360,9 +360,11 @@ function makeEdge({ x1, y1, x2, y2, points: absPts = null, kind = "arrow", from 
     lastCommittedPoint: points[points.length - 1],
     startBinding: from ? { elementId: from, focus: 0, gap: 8 } : null,
     endBinding: to ? { elementId: to, focus: 0, gap: 8 } : null,
-    startArrowhead: null,
-    endArrowhead: kind === "arrow" ? "arrow" : null,
-    elbowed: false,
+    startArrowhead: style.startArrowhead !== undefined ? style.startArrowhead : null,
+    endArrowhead:
+      style.endArrowhead !== undefined ? style.endArrowhead : kind === "arrow" ? "arrow" : null,
+    elbowed: style.elbowed ?? false,
+    fixedSegments: style.elbowed ? [] : null,
     strokeColor: style.stroke ?? "#1e1e1e",
     strokeWidth: style.strokeWidth ?? 2,
     strokeStyle: style.strokeStyle ?? "solid",
@@ -392,16 +394,39 @@ function makeEdge({ x1, y1, x2, y2, points: absPts = null, kind = "arrow", from 
   return { edge, extra };
 }
 
-/** Centered label text on top of a shape (unbound). Returns text element. */
-function shapeLabel(shape, label, fontSize = 20) {
-  const { width, height } = measureText(label, fontSize);
-  return makeText({
-    x: Math.round(shape.x + (shape.width - width) / 2),
-    y: Math.round(shape.y + (shape.height - height) / 2),
+/**
+ * Label text for a shape. Bound by default (containerId + boundElements):
+ * bound labels move/resize with the container and survive human edits.
+ * Set unbound=true for the legacy midpoint overlay (edges always unbound —
+ * arrows are not containers).
+ */
+function shapeLabel(shape, label, fontSize = 20, unbound = false) {
+  let fs = fontSize;
+  let m = measureText(label, fs);
+  if (!unbound) {
+    // shrink to fit inside the container (app wraps bound text on edit)
+    while (fs > 12 && m.width > shape.width - 20) {
+      fs -= 2;
+      m = measureText(label, fs);
+    }
+  }
+  const t = makeText({
+    x: Math.round(shape.x + (shape.width - m.width) / 2),
+    y: Math.round(shape.y + (shape.height - m.height) / 2),
     text: label,
-    fontSize,
+    fontSize: fs,
   });
+  if (!unbound) {
+    t.containerId = shape.id;
+    shape.boundElements.push({ type: "text", id: t.id });
+  }
+  return t;
 }
+
+// container types a text label may bind to (mirrors the app's bindable set)
+const LABEL_CONTAINERS = new Set([
+  "rectangle", "ellipse", "diamond", "image", "embeddable", "iframe", "frame",
+]);
 
 /** Freehand stroke through absolute points. Pressures default to 0.5 (app simulates). */
 function makeFreedraw(abs, { pressures = null, style = {} } = {}) {
@@ -466,7 +491,80 @@ const IMAGE_MIMES = {
   ".gif": "image/gif",
 };
 
-/** Read a raster file into a doc.files[fileId] entry. Throws loud failures. */
+/** Intrinsic pixel dimensions from image headers (zero deps). Null if unreadable. */
+function imageDims(buf, ext) {
+  try {
+    if (ext === ".png") {
+      if (buf.length < 33) return null;
+      if (buf.toString("ascii", 12, 16) !== "IHDR") return null;
+      return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+    }
+    if (ext === ".gif") {
+      if (buf.length < 10) return null;
+      const sig = buf.toString("ascii", 0, 6);
+      if (sig !== "GIF87a" && sig !== "GIF89a") return null;
+      return { w: buf.readUInt16LE(6), h: buf.readUInt16LE(8) };
+    }
+    if (ext === ".jpg" || ext === ".jpeg") {
+      if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
+      const SOF = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+      let p = 2;
+      while (p + 4 < buf.length) {
+        if (buf[p] !== 0xff) return null;
+        const marker = buf[p + 1];
+        if (marker === 0xd8 || marker === 0xd9) {
+          p += 2;
+          continue;
+        }
+        if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+          p += 2;
+          continue;
+        }
+        const len = buf.readUInt16BE(p + 2);
+        if (SOF.has(marker)) return { w: buf.readUInt16BE(p + 7), h: buf.readUInt16BE(p + 5) };
+        p += 2 + len;
+      }
+      return null;
+    }
+    if (ext === ".webp") {
+      if (buf.length < 30) return null;
+      if (buf.toString("ascii", 0, 4) !== "RIFF" || buf.toString("ascii", 8, 12) !== "WEBP") return null;
+      const fourcc = buf.toString("ascii", 12, 16);
+      if (fourcc === "VP8 ") {
+        // lossy bitstream: 14-bit width at frame-tag+6, height +8
+        const w = buf.readUInt16LE(26) & 0x3fff;
+        const h = buf.readUInt16LE(28) & 0x3fff;
+        return w > 0 && h > 0 ? { w, h } : null;
+      }
+      if (fourcc === "VP8L") {
+        const bits = buf.readUInt32LE(21);
+        return { w: (bits & 0x3fff) + 1, h: ((bits >> 14) & 0x3fff) + 1 };
+      }
+      if (fourcc === "VP8X") {
+        return { w: buf.readUIntLE(24, 3) + 1, h: buf.readUIntLE(27, 3) + 1 };
+      }
+      return null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function imageDimsOf(path) {
+  const abs = resolve(path);
+  const ext = extname(abs).toLowerCase();
+  if (!IMAGE_MIMES[ext]) return null;
+  try {
+    return imageDims(readFileSync(abs), ext);
+  } catch {
+    return null;
+  }
+}
+
+/** Read a raster file into a doc.files[fileId] entry. Throws loud failures.
+ *  Identical bytes reuse the existing fileId (the app fails to resolve
+ *  duplicate file entries carrying the same dataURL). */
 function loadImageFile(doc, path) {
   const abs = resolve(path);
   if (!existsSync(abs)) fail(`image not found: ${path}`, 1);
@@ -475,12 +573,15 @@ function loadImageFile(doc, path) {
     fail(`unsupported image ${JSON.stringify(extname(abs))} — png|jpg|jpeg|webp|gif`, 1);
   const buf = readFileSync(abs);
   if (!buf.length) fail(`empty image file: ${path}`, 1);
-  const fileId = nid();
+  const dataURL = `data:${mime};base64,${buf.toString("base64")}`;
   doc.files = doc.files || {};
+  for (const [fid, f] of Object.entries(doc.files))
+    if (f && f.dataURL === dataURL) return fid; // same bytes: share the entry
+  const fileId = nid();
   doc.files[fileId] = {
     mimeType: mime,
     id: fileId,
-    dataURL: `data:${mime};base64,${buf.toString("base64")}`,
+    dataURL,
     created: Date.now(),
   };
   return fileId;
@@ -1128,6 +1229,11 @@ function cmdValidate(rawArgs) {
       if (el.type === "arrow" || el.type === "line") {
         if (!Array.isArray(el.points) || el.points.length < 2 || !el.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))
           problems.push(`${el.id} points must be 2+ [x,y] pairs`);
+        for (const k of ["startArrowhead", "endArrowhead"])
+          if (el[k] !== undefined && el[k] !== null && !["arrow", "triangle", "triangle_outline", "diamond", "diamond_outline", "circle", "circle_outline", "bar"].includes(el[k]))
+            problems.push(`${el.id} bad ${k} ${JSON.stringify(el[k])}`);
+        if (el.elbowed && el.fixedSegments !== undefined && el.fixedSegments !== null && !Array.isArray(el.fixedSegments))
+          problems.push(`${el.id} elbowed arrow needs fixedSegments array|null`);
       }
       for (const k of ["startBinding", "endBinding"])
         if (el[k] && !byId.has(el[k].elementId))
@@ -1143,6 +1249,14 @@ function cmdValidate(rawArgs) {
       }
       if (el.type === "embeddable" && !(typeof el.link === "string" && el.link.length))
         problems.push(`${el.id} embeddable needs a link URL`);
+      if (el.type === "text" && el.containerId != null) {
+        const target = byId.get(el.containerId);
+        if (!target) problems.push(`${el.id} containerId ${el.containerId} is not a live element`);
+        else if (!LABEL_CONTAINERS.has(target.type))
+          problems.push(`${el.id} containerId target ${target.id} is ${target.type}, not a label container`);
+        else if (!Array.isArray(target.boundElements) || !target.boundElements.some((b) => b && b.type === "text" && b.id === el.id))
+          problems.push(`${el.id} container ${target.id} missing reciprocal boundElements text entry`);
+      }
       if (el.frameId != null && (!byId.has(el.frameId) || byId.get(el.frameId).type !== "frame"))
         problems.push(`${el.id} frameId ${el.frameId} is not a live frame`);
       if (Array.isArray(el.boundElements))
@@ -1339,10 +1453,14 @@ const ADD_FLAGS = [
   { name: "font-family", type: "string" },
   { name: "text-align", type: "string" },
   { name: "label", type: "string" },
+  { name: "unbound", type: "boolean" },
   { name: "locked", type: "boolean" },
   { name: "link", type: "string" },
   { name: "frame", type: "string" },
   { name: "arrow-type", type: "string" },
+  { name: "start-arrowhead", type: "string" },
+  { name: "end-arrowhead", type: "string" },
+  { name: "elbow", type: "boolean" },
   { name: "from", type: "string" },
   { name: "to", type: "string" },
   { name: "x1", type: "string" },
@@ -1405,6 +1523,25 @@ function cmdAdd(rawArgs) {
     }
     if (opts["arrow-type"] !== undefined)
       style.arrowType = oneOf(opts["arrow-type"], "arrow-type", ["sharp", "round"]);
+    if (opts["start-arrowhead"] !== undefined || opts["end-arrowhead"] !== undefined) {
+      if (kind !== "arrow") fail("arrowheads need kind arrow (the renderer draws no heads on lines)", 2);
+      const head = (v, name) => {
+        const h = oneOf(v, name, ["none", "arrow", "triangle", "triangle_outline", "diamond", "diamond_outline", "circle", "circle_outline", "bar"]);
+        return h === "none" ? null : h;
+      };
+      if (opts["start-arrowhead"] !== undefined) style.startArrowhead = head(opts["start-arrowhead"], "start-arrowhead");
+      if (opts["end-arrowhead"] !== undefined) style.endArrowhead = head(opts["end-arrowhead"], "end-arrowhead");
+    }
+    if (opts.elbow) {
+      if (kind !== "arrow") fail("--elbow needs kind arrow", 2);
+      if (absPts.length !== 2) fail("--elbow needs exactly 2 endpoints (use --from/--to or --x1/--y1/--x2/--y2)", 2);
+      // The app stores elbow corners explicitly (no auto-route on load):
+      // insert the orthogonal corner so the arrow renders as an L.
+      const [[x1, y1], [x2, y2]] = absPts;
+      if (x1 !== x2 && y1 !== y2)
+        absPts = Math.abs(x2 - x1) >= Math.abs(y2 - y1) ? [[x1, y1], [x2, y1], [x2, y2]] : [[x1, y1], [x1, y2], [x2, y2]];
+      style.elbowed = true;
+    }
     const { edge, extra } = makeEdge({ points: absPts, kind, from, to, label: opts.label || null, style });
     push(edge, ...extra);
     if (from) findElement(doc, from).boundElements.push({ type: "arrow", id: edge.id });
@@ -1440,6 +1577,28 @@ function cmdAdd(rawArgs) {
     const fileId = loadImageFile(doc, opts.file);
     const w = opts.w ?? opts.width;
     const h = opts.h ?? opts.height;
+    let iw;
+    let ih;
+    if (w !== undefined && h !== undefined) {
+      iw = num(w, "w");
+      ih = num(h, "h");
+    } else {
+      // preserve the raster's aspect: explicit side wins, else intrinsic size
+      const dims = imageDimsOf(opts.file);
+      if (!dims) fail(`cannot read dimensions of ${opts.file} — pass --w and --h explicitly`, 1);
+      if (w !== undefined) {
+        iw = num(w, "w");
+        ih = Math.max(1, Math.round(iw / (dims.w / dims.h)));
+      } else if (h !== undefined) {
+        ih = num(h, "h");
+        iw = Math.max(1, Math.round(ih * (dims.w / dims.h)));
+      } else {
+        const longest = Math.max(dims.w, dims.h);
+        const scale = longest > 1000 ? 1000 / longest : 1;
+        iw = Math.max(1, Math.round(dims.w * scale));
+        ih = Math.max(1, Math.round(dims.h * scale));
+      }
+    }
     let x = opts.x !== undefined ? num(opts.x, "x") : undefined;
     let y = opts.y !== undefined ? num(opts.y, "y") : undefined;
     if (x === undefined || y === undefined) {
@@ -1447,7 +1606,7 @@ function cmdAdd(rawArgs) {
       if (x === undefined) x = p.x;
       if (y === undefined) y = p.y;
     }
-    push(makeImage({ x, y, w: w !== undefined ? num(w, "w") : 320, h: h !== undefined ? num(h, "h") : 240, fileId, style }));
+    push(makeImage({ x, y, w: iw, h: ih, fileId, style }));
   } else if (kind === "embed") {
     if (!opts.link) fail("embed needs --link <https://...>", 2);
     if (!isHttpUrl(opts.link)) fail(`--link must be an http(s) URL, got ${JSON.stringify(opts.link)}`, 2);
@@ -1495,7 +1654,7 @@ function cmdAdd(rawArgs) {
           });
     push(el);
     if (opts.label && kind !== "text") {
-      const t = shapeLabel(el, opts.label, 18);
+      const t = shapeLabel(el, opts.label, 18, !!opts.unbound);
       push(t);
     } else if (opts.label) {
       fail("--label is for shapes; text already carries --text", 2);
@@ -1545,6 +1704,25 @@ function strandedArrows(doc, movedIds, followedIds) {
   );
 }
 
+/**
+ * Translate texts bound (containerId) to moved containers.
+ * deltas: Map<containerId, {dx, dy}>. Bound labels always follow — a label
+ * has exactly one anchor, so there is no ambiguous partial case.
+ */
+function followBoundTexts(doc, deltas) {
+  let n = 0;
+  for (const el of liveElements(doc)) {
+    if (el.type === "text" && el.containerId && deltas.has(el.containerId)) {
+      const d = deltas.get(el.containerId);
+      el.x += d.dx;
+      el.y += d.dy;
+      el.updated = Date.now();
+      n++;
+    }
+  }
+  return n;
+}
+
 function cmdMove(rawArgs) {
   const { pos, opts } = parseArgs(rawArgs, {
     flags: [
@@ -1567,7 +1745,10 @@ function cmdMove(rawArgs) {
   if (!hasAbs && !hasDelta) fail("move needs --x/--y or --dx/--dy", 2);
   const dx = opts.dx !== undefined ? num(opts.dx, "dx") : 0;
   const dy = opts.dy !== undefined ? num(opts.dy, "dy") : 0;
+  const deltas = new Map();
   for (const el of els) {
+    const ox = el.x;
+    const oy = el.y;
     if (hasAbs) {
       if (opts.x !== undefined) el.x = num(opts.x, "x");
       if (opts.y !== undefined) el.y = num(opts.y, "y");
@@ -1575,14 +1756,18 @@ function cmdMove(rawArgs) {
       translateEl(el, dx, dy);
     }
     el.updated = Date.now();
+    deltas.set(el.id, { dx: el.x - ox, dy: el.y - oy });
   }
   // Arrows bound on every bound end to the moved set follow along.
   const followed = hasAbs ? [] : boundFollowers(doc, ids);
   for (const a of followed) translateEl(a, dx, dy);
+  // Bound labels always follow their container.
+  const followedTexts = followBoundTexts(doc, deltas);
   saveScene(abs, doc);
   const out = [
     `moved: ${els.length} element${els.length === 1 ? "" : "s"}` +
-      (followed.length ? ` (+${followed.length} bound arrow${followed.length === 1 ? "" : "s"} followed)` : ""),
+      (followed.length ? ` (+${followed.length} bound arrow${followed.length === 1 ? "" : "s"} followed)` : "") +
+      (followedTexts ? ` (+${followedTexts} bound label${followedTexts === 1 ? "" : "s"})` : ""),
   ];
   const stranded = strandedArrows(doc, ids, followed.map((a) => a.id));
   if (stranded.length)
@@ -1604,6 +1789,26 @@ function cmdDelete(rawArgs) {
     el.isDeleted = true;
     el.updated = Date.now();
     n++;
+  }
+  // repair references so validate stays clean: drop boundElements entries,
+  // bindings and containerIds pointing at the deleted ids
+  const gone = new Set(ids);
+  for (const el of doc.elements) {
+    if (!el || typeof el !== "object") continue;
+    if (Array.isArray(el.boundElements)) {
+      const before = el.boundElements.length;
+      el.boundElements = el.boundElements.filter((b) => !b || !b.id || !gone.has(b.id));
+      if (el.boundElements.length !== before) el.updated = Date.now();
+    }
+    for (const k of ["startBinding", "endBinding"])
+      if (el[k] && gone.has(el[k].elementId)) {
+        el[k] = null;
+        el.updated = Date.now();
+      }
+    if (el.containerId && gone.has(el.containerId)) {
+      el.containerId = null;
+      el.updated = Date.now();
+    }
   }
   saveScene(abs, doc);
   process.stdout.write(
@@ -1673,7 +1878,10 @@ function cmdAlign(rawArgs) {
   const { doc, abs } = loadScene(pos[0]);
   const els = resolveIds(doc, pos.slice(1));
   const box = selBox(els);
+  const deltas = new Map();
   for (const el of els) {
+    const ox = el.x;
+    const oy = el.y;
     if (mode === "left") el.x = box.x0;
     else if (mode === "center") el.x = Math.round(box.x0 + (box.w - (el.width || 0)) / 2);
     else if (mode === "right") el.x = Math.round(box.x1 - (el.width || 0));
@@ -1681,9 +1889,11 @@ function cmdAlign(rawArgs) {
     else if (mode === "middle") el.y = Math.round(box.y0 + (box.h - (el.height || 0)) / 2);
     else if (mode === "bottom") el.y = Math.round(box.y1 - (el.height || 0));
     el.updated = Date.now();
+    deltas.set(el.id, { dx: el.x - ox, dy: el.y - oy });
   }
+  const followedTexts = followBoundTexts(doc, deltas);
   saveScene(abs, doc);
-  const out = [`aligned: ${els.length} elements --${mode}`];
+  const out = [`aligned: ${els.length} elements --${mode}` + (followedTexts ? ` (+${followedTexts} bound labels)` : "")];
   const stranded = strandedArrows(doc, els.map((e) => e.id), []);
   if (stranded.length)
     out.push(`(left behind: ${stranded.length} bound arrows — re-add them)`);
@@ -1715,12 +1925,17 @@ function cmdDistribute(rawArgs) {
   const gap = (last - first - total) / (sorted.length - 1);
   if (gap < 0) fail("distribute: elements overlap along the axis — spread them first", 1);
   let cursor = first;
+  const deltas = new Map();
   for (const el of sorted) {
+    const ox = el.x;
+    const oy = el.y;
     if (horiz) el.x = Math.round(cursor);
     else el.y = Math.round(cursor);
     el.updated = Date.now();
+    deltas.set(el.id, { dx: el.x - ox, dy: el.y - oy });
     cursor += size(el) + gap;
   }
+  followBoundTexts(doc, deltas);
   saveScene(abs, doc);
   process.stdout.write(
     [`distributed: ${els.length} elements (${horiz ? "horizontal" : "vertical"}, gap ${Math.round(gap)})`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
@@ -1736,7 +1951,7 @@ function cmdFlip(rawArgs) {
     positional: Infinity,
   });
   if (opts.help) return printHelp("flip");
-  if (pos.length < 3) fail("flip requires <file> <id...> (1+)", 2);
+  if (pos.length < 2) fail("flip requires <file> <id...>", 2);
   if (!!opts.horizontal === !!opts.vertical)
     fail("flip needs exactly one of --horizontal|--vertical", 2);
   const { doc, abs } = loadScene(pos[0]);
@@ -1745,7 +1960,10 @@ function cmdFlip(rawArgs) {
   const cx = box.x0 + box.w / 2;
   const cy = box.y0 + box.h / 2;
   const horiz = !!opts.horizontal;
+  const deltas = new Map();
   for (const el of els) {
+    const ox = el.x;
+    const oy = el.y;
     if (horiz) {
       el.x = Math.round(2 * cx - el.x - (el.width || 0));
       if (Array.isArray(el.points)) el.points = el.points.map(([px, py]) => [(el.width || 0) - px, py]);
@@ -1756,11 +1974,40 @@ function cmdFlip(rawArgs) {
       if (el.type !== "text") el.angle = -(el.angle || 0);
     }
     el.updated = Date.now();
+    deltas.set(el.id, { dx: el.x - ox, dy: el.y - oy });
   }
+  followBoundTexts(doc, deltas);
   saveScene(abs, doc);
   process.stdout.write(
     [`flipped: ${els.length} elements (${horiz ? "horizontal" : "vertical"})`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
   );
+}
+
+/** Deep-clone elements with fresh ids, translated by (dx,dy). Bindings and
+ *  containerIds remap inside the set, dangling refs outside are dropped. */
+function cloneWithFreshIds(els, dx, dy) {
+  const srcIds = new Set(els.map((e) => e.id));
+  const remap = new Map(els.map((e) => [e.id, nid()]));
+  return els.map((el) => {
+    const c = JSON.parse(JSON.stringify(el));
+    c.id = remap.get(el.id);
+    c.seed = randomInt(0, 2 ** 31);
+    c.versionNonce = randomInt(0, 2 ** 31);
+    c.version = 1;
+    c.updated = Date.now();
+    c.isDeleted = false;
+    c.x += dx;
+    c.y += dy;
+    // rebind inside the duplicated set, drop dangling refs outside it
+    for (const k of ["startBinding", "endBinding"])
+      if (c[k]) c[k] = srcIds.has(c[k].elementId) ? { ...c[k], elementId: remap.get(c[k].elementId) } : null;
+    if (c.containerId) c.containerId = srcIds.has(c.containerId) ? remap.get(c.containerId) : null;
+    if (Array.isArray(c.boundElements))
+      c.boundElements = c.boundElements
+        .filter((b) => !b.id || srcIds.has(b.id))
+        .map((b) => ({ ...b, id: remap.get(b.id) ?? b.id }));
+    return c;
+  });
 }
 
 function cmdDuplicate(rawArgs) {
@@ -1777,27 +2024,7 @@ function cmdDuplicate(rawArgs) {
   const els = resolveIds(doc, pos.slice(1));
   const dx = opts.dx !== undefined ? num(opts.dx, "dx") : 20;
   const dy = opts.dy !== undefined ? num(opts.dy, "dy") : 20;
-  const srcIds = new Set(els.map((e) => e.id));
-  const remap = new Map(els.map((e) => [e.id, nid()]));
-  const clones = els.map((el) => {
-    const c = JSON.parse(JSON.stringify(el));
-    c.id = remap.get(el.id);
-    c.seed = randomInt(0, 2 ** 31);
-    c.versionNonce = randomInt(0, 2 ** 31);
-    c.version = 1;
-    c.updated = Date.now();
-    c.isDeleted = false;
-    c.x += dx;
-    c.y += dy;
-    // rebind inside the duplicated set, drop dangling refs outside it
-    for (const k of ["startBinding", "endBinding"])
-      if (c[k]) c[k] = srcIds.has(c[k].elementId) ? { ...c[k], elementId: remap.get(c[k].elementId) } : null;
-    if (Array.isArray(c.boundElements))
-      c.boundElements = c.boundElements
-        .filter((b) => !b.id || srcIds.has(b.id))
-        .map((b) => ({ ...b, id: remap.get(b.id) ?? b.id }));
-    return c;
-  });
+  const clones = cloneWithFreshIds(els, dx, dy);
   doc.elements.push(...clones);
   saveScene(abs, doc);
   process.stdout.write(
@@ -1895,6 +2122,99 @@ function cmdOrder(rawArgs) {
   process.stdout.write(
     [`ordered: ${sel.size} elements --${mode}`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
   );
+}
+
+// ---------- libraries (.excalidrawlib) ----------
+function loadLib(path) {
+  const abs = resolve(path);
+  if (!existsSync(abs)) return { abs, lib: null };
+  let lib;
+  try {
+    lib = JSON.parse(readFileSync(abs, "utf8"));
+  } catch (e) {
+    fail(`invalid JSON in library ${path}: ${e.message}`, 1);
+  }
+  if (lib.type !== "excalidrawlib" || !Array.isArray(lib.libraryItems))
+    fail(`${path} is not an .excalidrawlib file (want {type:"excalidrawlib", libraryItems:[]})`, 1);
+  return { abs, lib };
+}
+
+function saveLib(abs, lib) {
+  writeFileSync(abs, JSON.stringify(lib, null, 2) + "\n");
+}
+
+function cmdLib(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "name", type: "string" },
+      { name: "dx", type: "string" },
+      { name: "dy", type: "string" },
+    ],
+    positional: Infinity,
+  });
+  if (opts.help) return printHelp("lib");
+  const [sub, ...rest] = pos;
+  if (sub === "list") {
+    if (rest.length !== 1) fail("lib list requires <libfile>", 2);
+    const { lib } = loadLib(rest[0]);
+    if (!lib) fail(`library not found: ${rest[0]}`, 1);
+    const out = [`items: ${lib.libraryItems.length}`];
+    if (lib.libraryItems.length)
+      out.push(
+        `items[${lib.libraryItems.length}]{id,elements,created}:`,
+        ...lib.libraryItems.map((it) => `  ${it.id},${(it.elements || []).length},${it.created ? new Date(it.created).toISOString().slice(0, 10) : "?"}`)
+      );
+    else out.push(`(empty library — add items with lib push)`);
+    out.push(helpLines([`excalidraw-axi lib unpack ${rest[0]} <item-id> <scene>`]));
+    process.stdout.write(out.join("\n") + "\n");
+    return;
+  }
+  if (sub === "push") {
+    if (rest.length < 2) fail("lib push requires <libfile> <scene> <id...>", 2);
+    const [libfile, scene, ...ids] = rest;
+    const { doc } = loadScene(scene);
+    const els = resolveIds(doc, ids);
+    const { abs, lib } = loadLib(libfile);
+    const target = lib || { type: "excalidrawlib", version: 2, libraryItems: [] };
+    const item = {
+      id: nid(),
+      status: "published",
+      elements: JSON.parse(JSON.stringify(els)),
+      created: Date.now(),
+    };
+    if (opts.name) item.name = opts.name;
+    target.libraryItems.push(item);
+    saveLib(abs, target);
+    process.stdout.write(
+      [`pushed: item ${item.id} (${els.length} elements) -> ${libfile}`, helpLines([`excalidraw-axi lib list ${libfile}`])].join("\n") + "\n"
+    );
+    return;
+  }
+  if (sub === "unpack") {
+    if (rest.length !== 3) fail("lib unpack requires <libfile> <item-id> <scene>", 2);
+    const [libfile, itemId, scene] = rest;
+    const { lib } = loadLib(libfile);
+    if (!lib) fail(`library not found: ${libfile}`, 1);
+    const item = lib.libraryItems.find((it) => it && it.id === itemId);
+    if (!item) fail(`library item not found: ${itemId}`, 1, [`excalidraw-axi lib list ${libfile}`]);
+    if (!Array.isArray(item.elements) || !item.elements.length)
+      fail(`library item ${itemId} has no elements`, 1);
+    const { doc, abs } = loadScene(scene);
+    const dx = opts.dx !== undefined ? num(opts.dx, "dx") : 0;
+    const dy = opts.dy !== undefined ? num(opts.dy, "dy") : 0;
+    const clones = cloneWithFreshIds(item.elements.filter((e) => e && !e.isDeleted), dx, dy);
+    doc.elements.push(...clones);
+    saveScene(abs, doc);
+    process.stdout.write(
+      [
+        `unpacked[${clones.length}]{id}:`,
+        ...clones.map((e) => `  ${e.id}`),
+        helpLines([`excalidraw-axi validate ${scene}`]),
+      ].join("\n") + "\n"
+    );
+    return;
+  }
+  fail(`lib needs push|list|unpack, got ${JSON.stringify(sub)}`, 2, ["excalidraw-axi lib --help"]);
 }
 
 function cmdClear(rawArgs) {
@@ -2056,6 +2376,73 @@ function helperResult(out) {
   return v;
 }
 
+// ---------- tab file transfer (images live in IDB files-store) ----------
+// The #url= loader does not ingest scene.files, so sync pre-seeds the tab's
+// files-store and pull reads it back. Payloads move in slices to stay clear
+// of arg/stdout size limits. step(args, what) runs a helper call, exits on
+// helper failure, and returns stdout.
+function idbPutFile(fid, rec, step) {
+  const json = JSON.stringify({ ...rec, id: fid, lastRetrieved: Date.now() });
+  const init = helperResult(step(["eval", "() => { window.__axi_file = ''; return 'ready'; }"], "stage image file"));
+  if (init !== "ready") fail("sync failed (tab would not stage image bytes)", 1);
+  const CH = 48 * 1024;
+  for (let i = 0; i < json.length; i += CH) {
+    const slice = json.slice(i, i + CH);
+    const got = Number(
+      helperResult(step(["eval", `() => { window.__axi_file += ${JSON.stringify(slice)}; return window.__axi_file.length; }`], "stage image file"))
+    );
+    if (got !== Math.min(i + CH, json.length)) fail("sync failed (image staging mismatch — tab storage unavailable?)", 1);
+  }
+  const doneRes = helperResult(
+    step(
+      [
+        "eval",
+        `() => new Promise(function(res){ var open = indexedDB.open("files-db"); open.onsuccess = function(){ var db = open.result; var tx = db.transaction("files-store", "readwrite"); tx.objectStore("files-store").put(JSON.parse(window.__axi_file), ${JSON.stringify(fid)}); tx.oncomplete = function(){ window.__axi_file = ""; res("stored"); }; tx.onerror = function(){ res("ERR"); }; }; open.onerror = function(){ res("ERR"); }; })`,
+      ],
+      "push image file"
+    )
+  );
+  if (doneRes !== "stored") fail(`sync failed (could not store image ${fid} in tab)`, 1);
+}
+
+/** Read one file record back. Returns {mimeType,id,dataURL,created} or null. */
+function idbGetFile(fid, step) {
+  const envJson = helperResult(
+    step(
+      [
+        "eval",
+        `() => new Promise(function(res){ var open = indexedDB.open("files-db"); open.onsuccess = function(){ var db = open.result; var tx = db.transaction("files-store", "readonly"); var q = tx.objectStore("files-store").get(${JSON.stringify(fid)}); q.onsuccess = function(){ var r = q.result; res(JSON.stringify(r ? { mimeType: r.mimeType, id: r.id || ${JSON.stringify(fid)}, created: r.created, len: String(r.dataURL || "").length } : null)); }; q.onerror = function(){ res("null"); }; }; open.onerror = function(){ res("null"); }; })`,
+      ],
+      "read tab files"
+    )
+  );
+  let env = null;
+  try {
+    env = JSON.parse(envJson);
+  } catch {}
+  if (!env || !env.len) return null;
+  const total = Number(env.len);
+  if (!(total > 0) || total > 8 * 1024 * 1024) return null;
+  let dataURL = "";
+  const CH = 128 * 1024;
+  for (let i = 0; i < total; i += CH) {
+    const end = Math.min(i + CH, total);
+    const slice = helperResult(
+      step(
+        [
+          "eval",
+          `() => new Promise(function(res){ var open = indexedDB.open("files-db"); open.onsuccess = function(){ var db = open.result; var tx = db.transaction("files-store", "readonly"); var q = tx.objectStore("files-store").get(${JSON.stringify(fid)}); q.onsuccess = function(){ res(String((q.result && q.result.dataURL) || "").slice(${i}, ${end})); }; q.onerror = function(){ res(""); }; }; open.onerror = function(){ res(""); }; })`,
+        ],
+        "read tab files"
+      )
+    );
+    if (typeof slice !== "string") return null;
+    dataURL += slice;
+  }
+  if (dataURL.length !== total) return null;
+  return { mimeType: env.mimeType, id: env.id, dataURL, created: env.created };
+}
+
 async function cmdSync(rawArgs) {
   const { pos, opts } = parseArgs(rawArgs, {
     flags: [
@@ -2131,6 +2518,10 @@ async function cmdSync(rawArgs) {
     process.stdout.write(`error: sync failed (could not clear canvas)\n`);
     done(1);
   }
+  // The #url= loader ignores scene.files — pre-seed the tab's files-store
+  // so images render instead of placeholders.
+  const fileIds = Object.keys(doc.files || {});
+  for (const fid of fileIds) idbPutFile(fid, doc.files[fid], step);
   step(["open", link], "open scene link");
   // Poll: the app fetches + renders async, then persists to localStorage.
   let got;
@@ -2141,9 +2532,14 @@ async function cmdSync(rawArgs) {
     if (got === want) break;
   }
   if (got === want) {
-    process.stdout.write(
-      [`synced: ${got} elements -> ${stripHash(viewer)}`, helpLines([`excalidraw-axi export ${pos[0]} --svg`])].join("\n") + "\n"
-    );
+    const nImages = liveElements(doc).filter((e) => e.type === "image").length;
+    const lines = [
+      `synced: ${got} elements${fileIds.length ? ` (+${fileIds.length} files)` : ""} -> ${stripHash(viewer)}`,
+    ];
+    if (nImages > 1)
+      lines.push(`(note: this app build resolves only single images on #url= load — with ${nImages} images the tab may show placeholders; export/validate are unaffected)`);
+    lines.push(helpLines([`excalidraw-axi export ${pos[0]} --svg`, `excalidraw-axi pull pulled.excalidraw`]));
+    process.stdout.write(lines.join("\n") + "\n");
     done(0);
   }
   process.stdout.write(
@@ -2153,6 +2549,117 @@ async function cmdSync(rawArgs) {
     ].join("\n") + "\n"
   );
   done(1);
+}
+
+/**
+ * pull: read a scene back into a .excalidraw file — the round-trip half of
+ * sync, so existing drawings (including human edits) can be edited by CLI.
+ * Default source is the live tab at --url (elements+appState from
+ * localStorage, image bytes from IDB files-store, both chunked).
+ * --from-url fetches a scene file or #url= link instead (no browser needed).
+ */
+async function cmdPull(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "url", type: "string" },
+      { name: "from-url", type: "string" },
+    ],
+    positional: 1,
+  });
+  if (opts.help) return printHelp("pull");
+  if (!pos[0]) fail("pull requires <out.excalidraw>", 2, ["excalidraw-axi pull pulled.excalidraw"]);
+  const out = resolve(pos[0]);
+
+  if (opts["from-url"]) {
+    let u = opts["from-url"];
+    const hm = u.match(/#url=(.+)$/);
+    if (hm) u = decodeURIComponent(hm[1]);
+    if (!/^https?:\/\//i.test(u)) fail(`--from-url must be an http(s) URL or #url= link`, 2);
+    let doc;
+    try {
+      const r = await fetch(u);
+      if (!r.ok) fail(`fetch failed: ${u} -> HTTP ${r.status}`, 1);
+      doc = await r.json();
+    } catch (e) {
+      if (e && e.message && e.message.startsWith("fetch failed")) throw e;
+      fail(`cannot load scene from ${u} (${e.message})`, 1);
+    }
+    if (!doc || !Array.isArray(doc.elements)) fail(`not a scene (no elements[]) at ${u}`, 1);
+    const scene = {
+      type: "excalidraw",
+      version: 2,
+      source: `excalidraw-axi pull ${u}`,
+      elements: doc.elements,
+      appState: { viewBackgroundColor: (doc.appState && doc.appState.viewBackgroundColor) || "#ffffff" },
+      files: doc.files || {},
+    };
+    writeFileSync(out, JSON.stringify(scene, null, 2) + "\n");
+    const nFiles = Object.keys(scene.files).length;
+    process.stdout.write(
+      [`pulled: ${scene.elements.length} elements${nFiles ? ` (+${nFiles} files)` : ""} -> ${pos[0]}`, helpLines([`excalidraw-axi validate ${pos[0]}`, `excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
+    );
+    return;
+  }
+
+  const probe = runHelper(["--help"]);
+  if (!probe.ok)
+    fail("pull needs the chrome-devtools-axi browser helper on PATH (it reads the tab)", 1, [
+      `excalidraw-axi pull ${pos[0]} --from-url <scene-url>   (no browser needed)`,
+    ]);
+  const viewer = opts.url || "http://localhost:5001";
+  const step = (args, what) => {
+    const r = runHelper(args);
+    if (!r.ok) fail(`pull failed at ${what} (browser helper error)`, 1);
+    return r.out;
+  };
+  step(["open", stripHash(viewer)], "open viewer");
+  const metaJson = helperResult(
+    step(
+      ["eval", `() => JSON.stringify(function(){ var els = JSON.parse(localStorage.getItem("excalidraw") || "[]"); var ids = []; for (var i = 0; i < els.length; i++) if (els[i] && els[i].type === "image" && els[i].fileId) ids.push(els[i].fileId); return { n: els.length, fileIds: ids }; }())`],
+      "read canvas"
+    )
+  );
+  let meta = null;
+  try {
+    meta = JSON.parse(metaJson);
+  } catch {}
+  if (!meta || typeof meta.n !== "number") fail("pull failed (canvas unreadable — is the tab on an Excalidraw page?)", 1);
+  const elements = [];
+  const CHUNK = 100;
+  for (let i = 0; i < meta.n; i += CHUNK) {
+    const part = helperResult(
+      step(["eval", `() => JSON.stringify((JSON.parse(localStorage.getItem("excalidraw") || "[]")).slice(${i}, ${i + CHUNK}))`], "read canvas")
+    );
+    if (typeof part !== "string") fail("pull failed (element payload unreadable)", 1);
+    elements.push(...JSON.parse(part));
+  }
+  let bg = "#ffffff";
+  try {
+    const appJson = helperResult(step(["eval", `() => localStorage.getItem("excalidraw-state") || "{}"`], "read canvas"));
+    const app = JSON.parse(appJson);
+    if (app && app.viewBackgroundColor) bg = app.viewBackgroundColor;
+  } catch {}
+  const files = {};
+  const unresolved = [];
+  for (const fid of meta.fileIds || []) {
+    const rec = idbGetFile(fid, step);
+    if (rec && rec.dataURL) files[fid] = { mimeType: rec.mimeType, id: rec.id, dataURL: rec.dataURL, created: rec.created };
+    else unresolved.push(fid);
+  }
+  const scene = {
+    type: "excalidraw",
+    version: 2,
+    source: "excalidraw-axi pull",
+    elements,
+    appState: { viewBackgroundColor: bg },
+    files,
+  };
+  writeFileSync(out, JSON.stringify(scene, null, 2) + "\n");
+  const bits = [`pulled: ${elements.length} elements${Object.keys(files).length ? ` (+${Object.keys(files).length} files)` : ""} -> ${pos[0]}`];
+  if (unresolved.length)
+    bits.push(`(unresolved images: ${unresolved.length} fileIds have no bytes in tab storage — elements kept, re-add via image --file: ${unresolved.slice(0, 3).join(",")}${unresolved.length > 3 ? "…" : ""})`);
+  bits.push(helpLines([`excalidraw-axi validate ${pos[0]}`, `excalidraw-axi view ${pos[0]}`]));
+  process.stdout.write(bits.join("\n") + "\n");
 }
 
 function cmdExport(rawArgs) {
@@ -2206,6 +2713,9 @@ function printHelp(topic) {
       "    --fill-style solid|hachure|cross-hatch|dots|zigzag --roundness sharp|round --angle N",
       "    --roughness 0..2 --opacity 0..100 --font-family 1..5 --text-align left|center|right",
       "    --locked --link <url> --frame <frame-id> --arrow-type sharp|round",
+      "    heads: --start-arrowhead/--end-arrowhead none|arrow|triangle|triangle_outline|",
+      "      diamond|diamond_outline|circle|circle_outline|bar; --elbow (2 endpoints)",
+      "    --label binds inside the shape (human-edit safe); --unbound = overlay text",
       "",
       "Arrange:",
       "  move <file> <id...> --dx N --dy N | --x N --y N (single)",
@@ -2224,6 +2734,9 @@ function printHelp(topic) {
       "  serve <file> [--port N] [--url U]   Scene file over CORS localhost server",
       "  open <file> [--port N] [--url U] [--no-launch]  Serve + open #url= link",
       "  sync <file> [--port N] [--url U]    Serve + verify via browser helper",
+      "  pull <out> [--url U]               Read the live tab back into a file",
+      "  pull <out> --from-url <link|url>    Fetch a scene file (no browser)",
+      "  lib push <lib> <scene> <id...> | lib list <lib> | lib unpack <lib> <item> <scene>",
       "",
       "Inspect / render:",
       "  list [dir]                 List scenes",
@@ -2275,13 +2788,17 @@ function printHelp(topic) {
       "  --font-family 1..5 --text-align --locked --link <url> --frame <frame-id>",
       "  --arrow-type sharp|round (arrows). stroke-style/fill-style/roundness apply",
       "  to shapes+edges (text keeps stroke/font/align/link/lock only).",
+      "  heads: --start-arrowhead/--end-arrowhead (arrow kind only), --elbow (2 pts).",
       "",
       "No --x/--y: auto-places below existing content. --from/--to binds the arrow",
-      "to both shapes (recorded in boundElements). Labels are midpoint/unbound text.",
-      "image embeds the raster as dataURL in files[]. embed renders inline only on",
+      "to both shapes (recorded in boundElements). --label binds inside the shape",
+      "(containerId + boundElements: moves/resizes with it, human-edit safe);",
+      "--unbound keeps the legacy overlay text. Edge labels stay midpoint text.",
+      "image keeps aspect (explicit side wins, else intrinsic ≤1000px) and embeds",
+      "the raster as dataURL in files[]. embed renders inline only on",
       "allowlisted hosts. No sticky type in OSS Excalidraw — use rectangle+text.",
     ].join("\n"),
-    move: "Usage: excalidraw-axi move <file> <id...> --dx N --dy N | (--x N --y N for one element)\n\nArrows bound on every end to the moved set follow; partially-bound arrows are reported left-behind.",
+    move: "Usage: excalidraw-axi move <file> <id...> --dx N --dy N | (--x N --y N for one element)\n\nArrows bound on every end to the moved set follow, as do bound labels; partially-bound arrows are reported left-behind.",
     group: "Usage: excalidraw-axi group <file> <id...>\n\nAssign a shared groupId (appended; prints it for ungroup).",
     ungroup: "Usage: excalidraw-axi ungroup <file> <group-id>\n\nRemove the group id from every element that has it.",
     align:
@@ -2302,7 +2819,18 @@ function printHelp(topic) {
     open:
       "Usage: excalidraw-axi open <file> [--port 5237] [--url U] [--no-launch]\n\nServe + launch the #url= link in a browser. Serves until Ctrl+C.",
     sync:
-      "Usage: excalidraw-axi sync <file> [--port 5237] [--url U]\n\nServe + load via the chrome-devtools-axi helper and verify element count. Exits 0 on match.",
+      "Usage: excalidraw-axi sync <file> [--port 5237] [--url U]\n\nServe + load via the chrome-devtools-axi helper and verify element count. Image files are pre-seeded into tab storage. Exits 0 on match.",
+    pull:
+      "Usage: excalidraw-axi pull <out.excalidraw> [--url U] | --from-url <link|url>\n\nRead a scene back: live tab (elements+appState+images, chunked) or fetch a scene file / #url= link (no browser). Unresolvable images are kept as elements and reported.",
+    lib: [
+      "Usage:",
+      "  excalidraw-axi lib push <lib.excalidrawlib> <scene> <id...> [--name T]",
+      "  excalidraw-axi lib list <lib.excalidrawlib>",
+      "  excalidraw-axi lib unpack <lib.excalidrawlib> <item-id> <scene> [--dx N --dy N]",
+      "",
+      "Push stores live elements as a library item (creates the lib file).",
+      "Unpack clones the item into a scene with fresh ids (bindings remapped).",
+    ].join("\n"),
     delete:
       "Usage: excalidraw-axi delete <file> <id...>\n\nSoft-delete (sets isDeleted, Excalidraw convention).",
     clear: "Usage: excalidraw-axi clear <file>\n\nRemove all elements (keeps appState).",
@@ -2365,6 +2893,10 @@ function main() {
       return cmdOpen(rest);
     case "sync":
       return cmdSync(rest);
+    case "pull":
+      return cmdPull(rest);
+    case "lib":
+      return cmdLib(rest);
     case "delete":
       return cmdDelete(rest);
     case "clear":
