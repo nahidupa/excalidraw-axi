@@ -1,0 +1,29 @@
+{
+  "name": "excalidraw-axi",
+  "version": "0.1.0",
+  "description": "Agent-ergonomic CLI for Excalidraw diagrams. File-first .excalidraw operations with token-efficient output (AXI).",
+  "type": "module",
+  "bin": {
+    "excalidraw-axi": "./bin/excalidraw-axi.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "keywords": [
+    "axi",
+    "excalidraw",
+    "agent",
+    "cli",
+    "diagram",
+    "whiteboard"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nahidupa/excalidraw-axi.git"
+  },
+  "homepage": "https://github.com/nahidupa/excalidraw-axi#readme"
+}
