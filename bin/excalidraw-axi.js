@@ -4,20 +4,23 @@
  * File-first .excalidraw operations with token-efficient (TOON-style) output.
  * Zero runtime dependencies. Node >= 18.
  *
- * v0.2: self-sufficient drawing — add/move/delete/get/clear element ops,
- * spec-driven create with auto-layout, real Mermaid flowchart conversion.
+ * v0.3: style flags + new element types (freedraw/frame/image/embed),
+ * arrange ops (group/align/distribute/flip/duplicate/lock/link/order),
+ * move drags fully-bound arrows, sequenceDiagram subset,
+ * live-instance sync via serve/open/sync (#url= + CORS server).
  *
  * AXI principles: token-efficient output, minimal default schemas, content
  * truncation (+ --full), pre-computed aggregates, definitive empty states,
  * structured errors & exit codes, content-first home view, contextual help[].
  */
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
-import { join, resolve, basename } from "node:path";
+import { join, resolve, basename, extname } from "node:path";
 import { randomBytes, randomInt } from "node:crypto";
-import { spawnSync } from "node:child_process";
-import { homedir } from "node:os";
+import { spawnSync, spawn } from "node:child_process";
+import { homedir, platform } from "node:os";
+import { createServer } from "node:http";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const TRUNCATE_AT = 200;
 const JSON_TRUNCATE_AT = 2000;
 
@@ -117,6 +120,78 @@ function color(v, name) {
   return v;
 }
 
+function oneOf(v, name, allowed) {
+  if (allowed.includes(v)) return v;
+  fail(`--${name} must be ${allowed.join("|")}, got ${JSON.stringify(v)}`, 2);
+  return v;
+}
+
+function inRange(v, name, lo, hi) {
+  const n = num(v, name);
+  if (n < lo || n > hi) fail(`--${name} must be ${lo}..${hi}, got ${JSON.stringify(v)}`, 2);
+  return n;
+}
+
+function isHttpUrl(v) {
+  return typeof v === "string" && /^https?:\/\/\S+$/i.test(v);
+}
+
+/** "x1,y1 x2,y2 ..." -> [[x1,y1],[x2,y2],...] (shared by arrows/lines/freedraw). */
+function parsePoints(str, min = 2) {
+  const pts = String(str)
+    .trim()
+    .split(/[\s;]+/)
+    .filter(Boolean)
+    .map((p) => {
+      const m = p.split(",").map(Number);
+      if (m.length !== 2 || !m.every(Number.isFinite))
+        fail(`--points must be "x1,y1 x2,y2 [...]", got ${JSON.stringify(str)}`, 2);
+      return m;
+    });
+  if (pts.length < min) fail(`--points needs at least ${min} points`, 2);
+  return pts;
+}
+
+/**
+ * Normalize the shared style flags from `add` into makeShape/makeText opts.
+ * Neutral keys (stroke/background/...) match makeShape; cmdAdd maps the
+ * few text fields explicitly. roundness sharp -> null, round -> per-kind
+ * object (adaptive for rectangles, proportional otherwise).
+ */
+function styleFor(kind, opts) {
+  const s = {};
+  if (opts.stroke !== undefined) s.stroke = color(opts.stroke, "stroke");
+  if (opts.background !== undefined || opts.bg !== undefined)
+    s.background = color(opts.background ?? opts.bg, "background");
+  if (opts["stroke-width"] !== undefined) s.strokeWidth = num(opts["stroke-width"], "stroke-width");
+  if (opts.roughness !== undefined) s.roughness = inRange(opts.roughness, "roughness", 0, 2);
+  if (opts.opacity !== undefined) s.opacity = inRange(opts.opacity, "opacity", 0, 100);
+  if (opts["stroke-style"] !== undefined)
+    s.strokeStyle = oneOf(opts["stroke-style"], "stroke-style", ["solid", "dashed", "dotted"]);
+  if (opts["fill-style"] !== undefined)
+    s.fillStyle = oneOf(opts["fill-style"], "fill-style", ["solid", "hachure", "cross-hatch", "dots", "zigzag"]);
+  if (opts.roundness !== undefined) {
+    const r = oneOf(opts.roundness, "roundness", ["sharp", "round"]);
+    s.roundness = r === "sharp" ? null : { type: kind === "rectangle" ? 3 : 2 };
+  }
+  if (opts.angle !== undefined) s.angle = num(opts.angle, "angle");
+  if (opts.locked) s.locked = true;
+  if (opts.link !== undefined) {
+    if (!isHttpUrl(opts.link)) fail(`--link must be an http(s) URL, got ${JSON.stringify(opts.link)}`, 2);
+    s.link = opts.link;
+  }
+  if (opts.frame !== undefined) s.frameId = opts.frame;
+  if (opts["font-family"] !== undefined) s.fontFamily = inRange(opts["font-family"], "font-family", 1, 5);
+  if (opts["text-align"] !== undefined)
+    s.textAlign = oneOf(opts["text-align"], "text-align", ["left", "center", "right"]);
+  return s;
+}
+
+const KNOWN_TYPES = new Set([
+  "rectangle", "ellipse", "diamond", "arrow", "line", "freedraw",
+  "text", "image", "frame", "magicframe", "embeddable", "iframe",
+]);
+
 // ---------- scene IO ----------
 function nid() {
   return randomBytes(8).toString("hex");
@@ -204,7 +279,7 @@ function measureText(text, fontSize) {
   };
 }
 
-function makeText({ x, y, text, fontSize = 20, strokeColor = "#1e1e1e" }) {
+function makeText({ x, y, text, fontSize = 20, strokeColor = "#1e1e1e", fontFamily = 1, textAlign = "left", link = null, locked = false, frameId = null, angle = 0 }) {
   const { width, height } = measureText(text, fontSize);
   return baseElement({
     id: nid(),
@@ -213,10 +288,11 @@ function makeText({ x, y, text, fontSize = 20, strokeColor = "#1e1e1e" }) {
     y,
     width,
     height,
+    angle,
     fontSize,
-    fontFamily: 1,
+    fontFamily,
     text,
-    textAlign: "left",
+    textAlign,
     verticalAlign: "top",
     autoResize: true,
     baseline: Math.round(height * 0.8),
@@ -224,6 +300,9 @@ function makeText({ x, y, text, fontSize = 20, strokeColor = "#1e1e1e" }) {
     containerId: null,
     originalText: text,
     strokeColor,
+    link,
+    locked,
+    frameId,
   });
 }
 
@@ -244,39 +323,67 @@ function makeShape(kind, o) {
     backgroundColor: o.background ?? "transparent",
     strokeColor: o.stroke ?? "#1e1e1e",
     strokeWidth: o.strokeWidth ?? 2,
+    strokeStyle: o.strokeStyle ?? "solid",
     roughness: o.roughness ?? 1,
     opacity: o.opacity ?? 100,
-    roundness: { type: kind === "rectangle" ? 3 : 2 },
+    fillStyle: o.fillStyle ?? "solid",
+    angle: o.angle ?? 0,
+    link: o.link ?? null,
+    locked: o.locked ?? false,
+    frameId: o.frameId ?? null,
+    roundness: o.roundness !== undefined ? o.roundness : { type: kind === "rectangle" ? 3 : 2 },
   });
 }
 
-/** Arrow/line between two absolute points; bindings optional element ids. */
-function makeEdge({ x1, y1, x2, y2, kind = "arrow", from = null, to = null, label = null }) {
-  const x = Math.min(x1, x2);
-  const y = Math.min(y1, y2);
-  const points = [
-    [x1 - x, y1 - y],
-    [x2 - x, y2 - y],
-  ];
+/**
+ * Arrow/line through absolute points (polyline); bindings optional element ids.
+ * Accepts {x1,y1,x2,y2} or {points:[[x,y],...]}. style: stroke/width/roughness/
+ * opacity/roundness/angle/link/locked/frameId + arrowType sharp|round.
+ */
+function makeEdge({ x1, y1, x2, y2, points: absPts = null, kind = "arrow", from = null, to = null, label = null, style = {} }) {
+  const abs = absPts || [[x1, y1], [x2, y2]];
+  const xs = abs.map((p) => p[0]);
+  const ys = abs.map((p) => p[1]);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  const points = abs.map(([px, py]) => [px - x, py - y]);
+  const w = Math.max(...xs) - x;
+  const h = Math.max(...ys) - y;
   const edge = baseElement({
     id: nid(),
     type: kind,
     x,
     y,
-    width: Math.max(1, Math.abs(x2 - x1)),
-    height: Math.max(1, Math.abs(y2 - y1)),
+    width: Math.max(1, w),
+    height: Math.max(1, h),
     points,
     lastCommittedPoint: points[points.length - 1],
     startBinding: from ? { elementId: from, focus: 0, gap: 8 } : null,
     endBinding: to ? { elementId: to, focus: 0, gap: 8 } : null,
     startArrowhead: null,
     endArrowhead: kind === "arrow" ? "arrow" : null,
+    elbowed: false,
+    strokeColor: style.stroke ?? "#1e1e1e",
+    strokeWidth: style.strokeWidth ?? 2,
+    strokeStyle: style.strokeStyle ?? "solid",
+    roughness: style.roughness ?? 1,
+    opacity: style.opacity ?? 100,
+    angle: style.angle ?? 0,
+    link: style.link ?? null,
+    locked: style.locked ?? false,
+    frameId: style.frameId ?? null,
+    roundness:
+      style.roundness !== undefined
+        ? style.roundness
+        : style.arrowType === "round"
+          ? { type: 2 }
+          : null,
   });
   const extra = [];
   if (label) {
     const t = makeText({
-      x: (x1 + x2) / 2 - 40,
-      y: (y1 + y2) / 2 - 30,
+      x: (x + (x + w)) / 2 - 40,
+      y: (y + (y + h)) / 2 - 30,
       text: label,
       fontSize: 16,
     });
@@ -293,6 +400,135 @@ function shapeLabel(shape, label, fontSize = 20) {
     y: Math.round(shape.y + (shape.height - height) / 2),
     text: label,
     fontSize,
+  });
+}
+
+/** Freehand stroke through absolute points. Pressures default to 0.5 (app simulates). */
+function makeFreedraw(abs, { pressures = null, style = {} } = {}) {
+  const xs = abs.map((p) => p[0]);
+  const ys = abs.map((p) => p[1]);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  const points = abs.map(([px, py]) => [px - x, py - y]);
+  const pr = pressures || points.map(() => 0.5);
+  return baseElement({
+    id: nid(),
+    type: "freedraw",
+    x,
+    y,
+    width: Math.max(1, Math.max(...xs) - x),
+    height: Math.max(1, Math.max(...ys) - y),
+    points,
+    pressures: pr,
+    simulatePressure: !pressures,
+    lastCommittedPoint: points[points.length - 1],
+    startBinding: null,
+    endBinding: null,
+    startArrowhead: null,
+    endArrowhead: null,
+    strokeColor: style.stroke ?? "#1e1e1e",
+    strokeWidth: style.strokeWidth ?? 2,
+    strokeStyle: style.strokeStyle ?? "solid",
+    roughness: style.roughness ?? 1,
+    opacity: style.opacity ?? 100,
+    angle: style.angle ?? 0,
+    locked: style.locked ?? false,
+    frameId: style.frameId ?? null,
+    roundness: style.roundness !== undefined ? style.roundness : { type: 2 },
+  });
+}
+
+function makeFrame({ x, y, w = 400, h = 300, name = "Frame", style = {} }) {
+  return baseElement({
+    id: nid(),
+    type: "frame",
+    x,
+    y,
+    width: w,
+    height: h,
+    name,
+    strokeColor: style.stroke ?? "#1e1e1e",
+    backgroundColor: style.background ?? "transparent",
+    strokeWidth: style.strokeWidth ?? 2,
+    strokeStyle: style.strokeStyle ?? "solid",
+    roughness: style.roughness ?? 0,
+    opacity: style.opacity ?? 100,
+    angle: style.angle ?? 0,
+    locked: style.locked ?? false,
+  });
+}
+
+const IMAGE_MIMES = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+/** Read a raster file into a doc.files[fileId] entry. Throws loud failures. */
+function loadImageFile(doc, path) {
+  const abs = resolve(path);
+  if (!existsSync(abs)) fail(`image not found: ${path}`, 1);
+  const mime = IMAGE_MIMES[extname(abs).toLowerCase()];
+  if (!mime)
+    fail(`unsupported image ${JSON.stringify(extname(abs))} — png|jpg|jpeg|webp|gif`, 1);
+  const buf = readFileSync(abs);
+  if (!buf.length) fail(`empty image file: ${path}`, 1);
+  const fileId = nid();
+  doc.files = doc.files || {};
+  doc.files[fileId] = {
+    mimeType: mime,
+    id: fileId,
+    dataURL: `data:${mime};base64,${buf.toString("base64")}`,
+    created: Date.now(),
+  };
+  return fileId;
+}
+
+function makeImage({ x, y, w = 320, h = 240, fileId, style = {} }) {
+  return baseElement({
+    id: nid(),
+    type: "image",
+    x,
+    y,
+    width: w,
+    height: h,
+    fileId,
+    scale: [1, 1],
+    strokeColor: style.stroke ?? "transparent",
+    backgroundColor: style.background ?? "transparent",
+    strokeWidth: style.strokeWidth ?? 2,
+    roughness: style.roughness ?? 1,
+    opacity: style.opacity ?? 100,
+    angle: style.angle ?? 0,
+    link: style.link ?? null,
+    locked: style.locked ?? false,
+    frameId: style.frameId ?? null,
+    roundness: style.roundness !== undefined ? style.roundness : { type: 3 },
+  });
+}
+
+/** Embeddable (Web Embed tool). URL lives in `link`; only allowlisted hosts render inline. */
+function makeEmbed({ x, y, w = 560, h = 315, url, style = {} }) {
+  return baseElement({
+    id: nid(),
+    type: "embeddable",
+    x,
+    y,
+    width: w,
+    height: h,
+    link: url,
+    strokeColor: style.stroke ?? "#1e1e1e",
+    backgroundColor: style.background ?? "transparent",
+    strokeWidth: style.strokeWidth ?? 2,
+    strokeStyle: style.strokeStyle ?? "solid",
+    roughness: style.roughness ?? 1,
+    opacity: style.opacity ?? 100,
+    angle: style.angle ?? 0,
+    locked: style.locked ?? false,
+    frameId: style.frameId ?? null,
+    roundness: style.roundness !== undefined ? style.roundness : { type: 3 },
   });
 }
 
@@ -425,7 +661,7 @@ function parseMermaidFlowchart(src) {
     startIdx = 1;
   } else if (/^(sequenceDiagram|classDiagram|stateDiagram|erDiagram|journey|gantt|pie|mindmap|timeline|gitGraph|sankey|requirementDiagram|c4Context|packet-beta|kanban)\b/i.test(lines[0])) {
     fail(
-      `unsupported mermaid type ${JSON.stringify(lines[0].split(/\s+/)[0])} — v0.2 converts flowchart/graph (TD,TB,LR,RL,BT) only`,
+      `unsupported mermaid type ${JSON.stringify(lines[0].split(/\s+/)[0])} — v0.3 converts flowchart/graph (TD,TB,LR,RL,BT) and sequenceDiagram only`,
       1,
       ["excalidraw-axi create --help"]
     );
@@ -547,7 +783,8 @@ function buildSceneFromGraph(nodes, edges, orientation, sourceNote) {
       y: p.y,
       w: n._w,
       h: n._h,
-      background: "#e3f2fd",
+      background: n._background ?? "#e3f2fd",
+      stroke: n._stroke,
     });
     idMap.set(id, shape.id);
     elements.push(shape, shapeLabel(shape, n.label, 18));
@@ -581,6 +818,144 @@ function buildSceneFromGraph(nodes, edges, orientation, sourceNote) {
     type: "excalidraw",
     version: 2,
     source: sourceNote || "https://github.com/nahidupa/excalidraw-axi",
+    elements,
+    appState: { viewBackgroundColor: "#ffffff" },
+    files: {},
+  };
+}
+
+// ---------- mermaid sequenceDiagram subset ----------
+function parseSequenceDiagram(src) {
+  const participants = new Map(); // id -> {id, label, kind}
+  const messages = []; // {from, to, label, dashed}
+  const notes = []; // {targets:[ids], text, at}
+  const problems = [];
+
+  function regParticipant(id, label, kind) {
+    if (!participants.has(id))
+      participants.set(id, { id, label: label || id, kind: kind || "participant" });
+    else if (label) {
+      const p = participants.get(id);
+      if (p.label === id) {
+        p.label = label;
+        p.kind = kind || p.kind;
+      }
+    }
+    return id;
+  }
+
+  const lines = src.split("\n");
+  let started = false;
+  for (let li = 0; li < lines.length; li++) {
+    const t = lines[li].trim();
+    if (!t || t.startsWith("%%")) continue;
+    if (!started) {
+      if (/^sequenceDiagram\b/i.test(t)) {
+        started = true;
+        continue;
+      }
+      fail("not a sequenceDiagram (first line must be `sequenceDiagram`)", 1);
+    }
+    let m;
+    if ((m = t.match(/^(participant|actor)\s+([A-Za-z0-9_]+)(?:\s+as\s+(.+))?$/i)))
+      regParticipant(m[2], (m[3] || "").trim(), m[1].toLowerCase());
+    else if ((m = t.match(/^([A-Za-z0-9_]+)\s*(-{1,2}(?:>>|>|-x|x))\s*([A-Za-z0-9_]+)\s*:\s*(.*)$/)) ||
+      (m = t.match(/^([A-Za-z0-9_]+)\s*(-{1,2}(?:>>|>|-x|x))\s*([A-Za-z0-9_]+)\s*$/))) {
+      const from = regParticipant(m[1]);
+      const to = regParticipant(m[3]);
+      messages.push({ from, to, label: (m[4] || "").trim(), dashed: m[2].startsWith("--") });
+    } else if ((m = t.match(/^Note\s+(over|left of|right of)\s+([A-Za-z0-9_,\s]+):\s*(.*)$/i))) {
+      const targets = m[2].split(",").map((s) => s.trim()).filter(Boolean);
+      targets.forEach((id) => regParticipant(id));
+      notes.push({ targets, text: m[3].trim() });
+    } else if (/^(autonumber|activate|deactivate|loop|alt|else|opt|par|and|rect|break|end|par\b|create|destroy)\b/i.test(t)) {
+      continue; // layout-hint lines: parsed for order, no geometry of their own
+    } else {
+      problems.push(`line ${li + 1}: cannot parse ${JSON.stringify(t)}`);
+    }
+  }
+  if (!participants.size) fail("sequenceDiagram has 0 participants — nothing to draw", 1);
+  if (!messages.length && !notes.length)
+    fail("sequenceDiagram has 0 messages/notes — nothing to draw", 1);
+  if (problems.length) fail(`sequenceDiagram parse failed:\n  ${problems.slice(0, 5).join("\n  ")}`, 1);
+  return { participants, messages, notes };
+}
+
+function buildSceneFromSequence({ participants, messages, notes }) {
+  const ids = [...participants.keys()];
+  const BOX_W = 170;
+  const BOX_H = 70;
+  const COL_W = 260;
+  const TOP = 100;
+  const MSG_TOP = 300;
+  const MSG_STEP = 70;
+  const cx = new Map(ids.map((id, i) => [id, ORIGIN_X + i * (BOX_W + COL_W) + BOX_W / 2]));
+  const totalMsgs = messages.length + notes.length;
+  const bottom = MSG_TOP + Math.max(0, totalMsgs - 1) * MSG_STEP + 120;
+  const elements = [];
+  const idMap = new Map();
+  for (const [id, p] of participants) {
+    const shape = makeShape(p.kind === "actor" ? "ellipse" : "rectangle", {
+      x: Math.round(cx.get(id) - BOX_W / 2),
+      y: TOP,
+      w: BOX_W,
+      h: BOX_H,
+      background: "#e3f2fd",
+    });
+    idMap.set(id, shape.id);
+    elements.push(shape, shapeLabel(shape, p.label, 18));
+    // lifeline: dashed line from box bottom to scene bottom
+    const { edge } = makeEdge({
+      x1: cx.get(id),
+      y1: TOP + BOX_H + 6,
+      x2: cx.get(id),
+      y2: bottom,
+      kind: "line",
+      style: { stroke: "#adb5bd", strokeWidth: 1, strokeStyle: "dashed", roughness: 0 },
+    });
+    edge.roundness = null;
+    elements.push(edge);
+  }
+  let row = 0;
+  const place = (fn) => fn(MSG_TOP + row++ * MSG_STEP);
+  for (const msg of messages) {
+    place((y) => {
+      const x1 = cx.get(msg.from);
+      const self = msg.from === msg.to;
+      const x2 = self ? x1 + 90 : cx.get(msg.to);
+      const dir = x2 >= x1 ? 1 : -1;
+      const { edge, extra } = makeEdge({
+        x1: self ? x1 : x1 + dir * (BOX_W / 2),
+        y1: y,
+        x2,
+        y2: y,
+        kind: "arrow",
+        style: msg.dashed ? { strokeStyle: "dashed" } : {},
+        label: msg.label || null,
+      });
+      const a = elements.find((e) => e.id === idMap.get(msg.from));
+      const b = elements.find((e) => e.id === idMap.get(msg.to));
+      if (a) a.boundElements.push({ type: "arrow", id: edge.id });
+      if (b && b !== a) b.boundElements.push({ type: "arrow", id: edge.id });
+      if (!self) {
+        edge.startBinding = { elementId: a.id, focus: 0, gap: 8 };
+        edge.endBinding = { elementId: b.id, focus: 0, gap: 8 };
+      }
+      elements.push(edge, ...extra);
+    });
+  }
+  for (const note of notes) {
+    place((y) => {
+      const xs = note.targets.map((id) => cx.get(id));
+      const mid = (Math.min(...xs) + Math.max(...xs)) / 2;
+      const t = makeText({ x: Math.round(mid - 60), y: Math.round(y - 40), text: note.text, fontSize: 15 });
+      elements.push(t);
+    });
+  }
+  return {
+    type: "excalidraw",
+    version: 2,
+    source: "https://github.com/nahidupa/excalidraw-axi",
     elements,
     appState: { viewBackgroundColor: "#ffffff" },
     files: {},
@@ -714,11 +1089,67 @@ function cmdValidate(rawArgs) {
   if (doc.type !== "excalidraw") problems.push(`type is ${JSON.stringify(doc.type)}, want "excalidraw"`);
   if (!Array.isArray(doc.elements)) problems.push("elements is not an array");
   else {
-    liveElements(doc).forEach((el) => {
-      if (!el || typeof el !== "object") return problems.push(`element not an object`);
+    const live = liveElements(doc);
+    const byId = new Map(live.filter((e) => e && typeof e === "object").map((e) => [e.id, e]));
+    const ids = new Set();
+    for (const el of live) {
+      if (!el || typeof el !== "object") {
+        problems.push(`element not an object`);
+        continue;
+      }
       for (const k of ["id", "type", "x", "y"])
         if (el[k] === undefined) problems.push(`${el.id || "?"} missing ${k}`);
-    });
+      if (el.id !== undefined) {
+        if (ids.has(el.id)) problems.push(`${el.id} duplicate id`);
+        ids.add(el.id);
+      }
+      if (el.type !== undefined && !KNOWN_TYPES.has(el.type))
+        problems.push(`${el.id || "?"} unknown type ${JSON.stringify(el.type)}`);
+      for (const k of ["x", "y", "width", "height"])
+        if (el[k] !== undefined && !Number.isFinite(el[k])) problems.push(`${el.id} ${k} not a number`);
+      if (el.width !== undefined && el.width < 0) problems.push(`${el.id} negative width`);
+      if (el.height !== undefined && el.height < 0) problems.push(`${el.id} negative height`);
+      if (el.opacity !== undefined && !(el.opacity >= 0 && el.opacity <= 100))
+        problems.push(`${el.id} opacity ${el.opacity} outside 0..100`);
+      if (el.roughness !== undefined && !(el.roughness >= 0 && el.roughness <= 2))
+        problems.push(`${el.id} roughness ${el.roughness} outside 0..2`);
+      if (el.strokeWidth !== undefined && el.type !== "text" && !(el.strokeWidth > 0))
+        problems.push(`${el.id} strokeWidth must be > 0`);
+      if (el.strokeStyle !== undefined && !["solid", "dashed", "dotted"].includes(el.strokeStyle))
+        problems.push(`${el.id} bad strokeStyle ${JSON.stringify(el.strokeStyle)}`);
+      if (el.fillStyle !== undefined && !["solid", "hachure", "cross-hatch", "dots", "zigzag"].includes(el.fillStyle))
+        problems.push(`${el.id} bad fillStyle ${JSON.stringify(el.fillStyle)}`);
+      if (el.roundness !== undefined && el.roundness !== null && ![1, 2, 3].includes(el.roundness.type))
+        problems.push(`${el.id} bad roundness ${JSON.stringify(el.roundness)}`);
+      if (el.fontFamily !== undefined && !(el.fontFamily >= 1 && el.fontFamily <= 5))
+        problems.push(`${el.id} fontFamily ${el.fontFamily} outside 1..5`);
+      if (el.textAlign !== undefined && !["left", "center", "right", "justify"].includes(el.textAlign))
+        problems.push(`${el.id} bad textAlign ${JSON.stringify(el.textAlign)}`);
+      if (el.type === "arrow" || el.type === "line") {
+        if (!Array.isArray(el.points) || el.points.length < 2 || !el.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))
+          problems.push(`${el.id} points must be 2+ [x,y] pairs`);
+      }
+      for (const k of ["startBinding", "endBinding"])
+        if (el[k] && !byId.has(el[k].elementId))
+          problems.push(`${el.id} dangling ${k} -> ${el[k].elementId} (re-add the arrow after edits)`);
+      if (el.type === "freedraw") {
+        if (!Array.isArray(el.points) || el.points.length < 2) problems.push(`${el.id} freedraw needs 2+ points`);
+        if (el.pressures !== undefined && (!Array.isArray(el.pressures) || el.pressures.length !== (el.points || []).length))
+          problems.push(`${el.id} pressures length must match points`);
+      }
+      if (el.type === "image") {
+        if (!el.fileId || !doc.files || !doc.files[el.fileId] || !doc.files[el.fileId].dataURL)
+          problems.push(`${el.id} image fileId ${JSON.stringify(el.fileId)} missing from files[]`);
+      }
+      if (el.type === "embeddable" && !(typeof el.link === "string" && el.link.length))
+        problems.push(`${el.id} embeddable needs a link URL`);
+      if (el.frameId != null && (!byId.has(el.frameId) || byId.get(el.frameId).type !== "frame"))
+        problems.push(`${el.id} frameId ${el.frameId} is not a live frame`);
+      if (Array.isArray(el.boundElements))
+        for (const b of el.boundElements)
+          if (b && b.id && !byId.has(b.id))
+            problems.push(`${el.id} boundElements references deleted/missing ${b.id}`);
+    }
   }
   if (problems.length) {
     process.stdout.write(
@@ -778,6 +1209,8 @@ function loadSpec(path) {
       label: String(n.label),
       _w: n.w ? num(n.w, "w") : undefined,
       _h: n.h ? num(n.h, "h") : undefined,
+      _stroke: n.stroke !== undefined ? color(String(n.stroke), "stroke") : undefined,
+      _background: n.background !== undefined ? color(String(n.background), "background") : undefined,
     });
   });
   const edges = [];
@@ -830,7 +1263,7 @@ function cmdCreate(rawArgs) {
       const elByLogical = new Map();
       for (const [id, n] of nodes) {
         const p = pos.get(id);
-        const shape = makeShape(n.shape, { x: p.x, y: p.y, w: n._w, h: n._h, background: "#e3f2fd" });
+        const shape = makeShape(n.shape, { x: p.x, y: p.y, w: n._w, h: n._h, background: n._background ?? "#e3f2fd", stroke: n._stroke });
         elByLogical.set(id, shape);
         elements.push(shape, shapeLabel(shape, n.label, 18));
       }
@@ -855,11 +1288,19 @@ function cmdCreate(rawArgs) {
   } else if (opts["mermaid-file"]) {
     const mf = resolve(opts["mermaid-file"]);
     if (!existsSync(mf)) fail(`mermaid file not found: ${opts["mermaid-file"]}`, 1);
-    const { direction, nodes, edges } = parseMermaidFlowchart(readFileSync(mf, "utf8"));
-    const orientation =
-      direction === "LR" ? "horizontal" : direction === "RL" ? "horizontal-rev" : direction === "BT" ? "vertical-rev" : "vertical";
-    scene = buildSceneFromGraph(nodes, edges, orientation);
-    note = `mermaid ${direction}: ${nodes.size} nodes, ${edges.length} edges`;
+    const src = readFileSync(mf, "utf8");
+    const first = (src.split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("%%")) || "");
+    if (/^sequenceDiagram\b/i.test(first)) {
+      const seq = parseSequenceDiagram(src);
+      scene = buildSceneFromSequence(seq);
+      note = `mermaid sequence: ${seq.participants.size} participants, ${seq.messages.length} messages`;
+    } else {
+      const { direction, nodes, edges } = parseMermaidFlowchart(src);
+      const orientation =
+        direction === "LR" ? "horizontal" : direction === "RL" ? "horizontal-rev" : direction === "BT" ? "vertical-rev" : "vertical";
+      scene = buildSceneFromGraph(nodes, edges, orientation);
+      note = `mermaid ${direction}: ${nodes.size} nodes, ${edges.length} edges`;
+    }
   } else {
     scene = makeSceneTitle(opts.title || opts.text || "Untitled diagram");
     note = "title template (use --spec or --mermaid-file to draw)";
@@ -887,11 +1328,21 @@ const ADD_FLAGS = [
   { name: "background", type: "string" },
   { name: "bg", type: "string" },
   { name: "stroke-width", type: "string" },
+  { name: "stroke-style", type: "string" },
+  { name: "fill-style", type: "string" },
+  { name: "roundness", type: "string" },
+  { name: "angle", type: "string" },
   { name: "roughness", type: "string" },
   { name: "opacity", type: "string" },
   { name: "text", type: "string" },
   { name: "font-size", type: "string" },
+  { name: "font-family", type: "string" },
+  { name: "text-align", type: "string" },
   { name: "label", type: "string" },
+  { name: "locked", type: "boolean" },
+  { name: "link", type: "string" },
+  { name: "frame", type: "string" },
+  { name: "arrow-type", type: "string" },
   { name: "from", type: "string" },
   { name: "to", type: "string" },
   { name: "x1", type: "string" },
@@ -899,8 +1350,17 @@ const ADD_FLAGS = [
   { name: "x2", type: "string" },
   { name: "y2", type: "string" },
   { name: "points", type: "string" },
+  { name: "pressures", type: "string" },
   { name: "file", short: "f", type: "string" },
 ];
+
+const ADD_KINDS = ["rectangle", "ellipse", "diamond", "text", "arrow", "line", "freedraw", "frame", "image", "embed"];
+
+function assertFrameExists(doc, frameId) {
+  const f = liveElements(doc).find((e) => e.id === frameId);
+  if (!f) fail(`frame not found: ${frameId}`, 1, ["excalidraw-axi view <file>"]);
+  if (f.type !== "frame") fail(`--frame needs a frame id, ${frameId} is ${f.type}`, 1);
+}
 
 function cmdAdd(rawArgs) {
   const { pos, opts } = parseArgs(rawArgs, { flags: ADD_FLAGS, positional: 2 });
@@ -909,55 +1369,98 @@ function cmdAdd(rawArgs) {
   if (!file || !kindRaw)
     fail("add requires <file> <type>", 2, ['excalidraw-axi add <file> rectangle --label "API"']);
   const kind = kindRaw.toLowerCase();
-  if (!["rectangle", "ellipse", "diamond", "text", "arrow", "line"].includes(kind))
-    fail(`unknown shape ${JSON.stringify(kindRaw)} — rectangle|ellipse|diamond|text|arrow|line`, 2);
+  if (!ADD_KINDS.includes(kind))
+    fail(`unknown shape ${JSON.stringify(kindRaw)} — ${ADD_KINDS.join("|")}`, 2);
   const { doc, abs } = loadScene(file);
-  const style = {
-    stroke: opts.stroke ? color(opts.stroke, "stroke") : undefined,
-    background: color(opts.background ?? opts.bg ?? "transparent", "background"),
-    strokeWidth: opts["stroke-width"] ? num(opts["stroke-width"], "stroke-width") : undefined,
-    roughness: opts.roughness ? num(opts.roughness, "roughness") : undefined,
-    opacity: opts.opacity ? num(opts.opacity, "opacity") : undefined,
-  };
+  if (opts.frame !== undefined) assertFrameExists(doc, opts.frame);
+  const style = styleFor(kind, opts);
   const added = [];
+  const push = (...els) => {
+    doc.elements.push(...els);
+    added.push(...els);
+  };
+
   if (kind === "arrow" || kind === "line") {
-    let x1, y1, x2, y2, from = null, to = null;
+    let absPts, from = null, to = null;
     if (opts.from || opts.to) {
-      if (!opts.from || !opts.to)
-        fail("arrow binding needs both --from <id> and --to <id>", 2);
+      if (!opts.from || !opts.to) fail("arrow binding needs both --from <id> and --to <id>", 2);
       const a = findElement(doc, opts.from);
       const b = findElement(doc, opts.to);
       from = a.id;
       to = b.id;
-      [x1, y1] = [a.x + a.width / 2, a.y + a.height / 2];
-      [x2, y2] = [b.x + b.width / 2, b.y + b.height / 2];
+      absPts = [
+        [a.x + a.width / 2, a.y + a.height / 2],
+        [b.x + b.width / 2, b.y + b.height / 2],
+      ];
     } else if (opts.points) {
-      const pts = opts.points.trim().split(/[\s;]+/).map((p) => {
-        const m = p.split(",").map(Number);
-        if (m.length !== 2 || !m.every(Number.isFinite))
-          fail(`--points must be "x1,y1 x2,y2", got ${JSON.stringify(opts.points)}`, 2);
-        return m;
-      });
-      if (pts.length < 2) fail(`--points needs at least 2 points`, 2);
-      [x1, y1] = pts[0];
-      [x2, y2] = pts[pts.length - 1];
+      absPts = parsePoints(opts.points);
     } else if (opts.x1 !== undefined || opts.y1 !== undefined || opts.x2 !== undefined || opts.y2 !== undefined) {
       if ([opts.x1, opts.y1, opts.x2, opts.y2].some((v) => v === undefined))
         fail("explicit arrow needs all of --x1 --y1 --x2 --y2", 2);
-      x1 = num(opts.x1, "x1");
-      y1 = num(opts.y1, "y1");
-      x2 = num(opts.x2, "x2");
-      y2 = num(opts.y2, "y2");
+      absPts = [[num(opts.x1, "x1"), num(opts.y1, "y1")], [num(opts.x2, "x2"), num(opts.y2, "y2")]];
     } else {
       fail("arrow needs --from/--to, --points, or --x1/--y1/--x2/--y2", 2, [
         "excalidraw-axi view <file>",
       ]);
     }
-    const { edge, extra } = makeEdge({ x1, y1, x2, y2, kind, from, to, label: opts.label || null });
-    doc.elements.push(edge, ...extra);
-    added.push(edge, ...extra);
+    if (opts["arrow-type"] !== undefined)
+      style.arrowType = oneOf(opts["arrow-type"], "arrow-type", ["sharp", "round"]);
+    const { edge, extra } = makeEdge({ points: absPts, kind, from, to, label: opts.label || null, style });
+    push(edge, ...extra);
     if (from) findElement(doc, from).boundElements.push({ type: "arrow", id: edge.id });
     if (to) findElement(doc, to).boundElements.push({ type: "arrow", id: edge.id });
+  } else if (kind === "freedraw") {
+    if (!opts.points) fail("freedraw needs --points \"x1,y1 x2,y2 ...\" (2+ points)", 2);
+    const absPts = parsePoints(opts.points);
+    let pressures = null;
+    if (opts.pressures !== undefined) {
+      pressures = String(opts.pressures).trim().split(/[\s,;]+/).filter(Boolean).map((p) => {
+        const n = Number(p);
+        if (!Number.isFinite(n) || n < 0 || n > 1)
+          fail(`--pressures must be 0..1 numbers, got ${JSON.stringify(p)}`, 2);
+        return n;
+      });
+      if (pressures.length !== absPts.length)
+        fail(`--pressures has ${pressures.length} values but --points has ${absPts.length}`, 2);
+    }
+    push(makeFreedraw(absPts, { pressures, style }));
+  } else if (kind === "frame") {
+    const w = opts.w ?? opts.width;
+    const h = opts.h ?? opts.height;
+    let x = opts.x !== undefined ? num(opts.x, "x") : undefined;
+    let y = opts.y !== undefined ? num(opts.y, "y") : undefined;
+    if (x === undefined || y === undefined) {
+      const p = autoPlace(doc);
+      if (x === undefined) x = p.x;
+      if (y === undefined) y = p.y;
+    }
+    push(makeFrame({ x, y, w: w !== undefined ? num(w, "w") : 400, h: h !== undefined ? num(h, "h") : 300, name: opts.label || opts.text || "Frame", style }));
+  } else if (kind === "image") {
+    if (!opts.file) fail("image needs --file <path.png>", 2);
+    const fileId = loadImageFile(doc, opts.file);
+    const w = opts.w ?? opts.width;
+    const h = opts.h ?? opts.height;
+    let x = opts.x !== undefined ? num(opts.x, "x") : undefined;
+    let y = opts.y !== undefined ? num(opts.y, "y") : undefined;
+    if (x === undefined || y === undefined) {
+      const p = autoPlace(doc);
+      if (x === undefined) x = p.x;
+      if (y === undefined) y = p.y;
+    }
+    push(makeImage({ x, y, w: w !== undefined ? num(w, "w") : 320, h: h !== undefined ? num(h, "h") : 240, fileId, style }));
+  } else if (kind === "embed") {
+    if (!opts.link) fail("embed needs --link <https://...>", 2);
+    if (!isHttpUrl(opts.link)) fail(`--link must be an http(s) URL, got ${JSON.stringify(opts.link)}`, 2);
+    const w = opts.w ?? opts.width;
+    const h = opts.h ?? opts.height;
+    let x = opts.x !== undefined ? num(opts.x, "x") : undefined;
+    let y = opts.y !== undefined ? num(opts.y, "y") : undefined;
+    if (x === undefined || y === undefined) {
+      const p = autoPlace(doc);
+      if (x === undefined) x = p.x;
+      if (y === undefined) y = p.y;
+    }
+    push(makeEmbed({ x, y, w: w !== undefined ? num(w, "w") : 560, h: h !== undefined ? num(h, "h") : 315, url: opts.link, style }));
   } else {
     const w = opts.w ?? opts.width;
     const h = opts.h ?? opts.height;
@@ -976,6 +1479,12 @@ function cmdAdd(rawArgs) {
             text: opts.text || fail("add text requires --text", 2),
             fontSize: opts["font-size"] ? num(opts["font-size"], "font-size") : 20,
             strokeColor: style.stroke ?? "#1e1e1e",
+            fontFamily: style.fontFamily ?? 1,
+            textAlign: style.textAlign ?? "left",
+            link: style.link ?? null,
+            locked: style.locked ?? false,
+            frameId: style.frameId ?? null,
+            angle: style.angle ?? 0,
           })
         : makeShape(kind, {
             x,
@@ -984,12 +1493,10 @@ function cmdAdd(rawArgs) {
             h: h !== undefined ? num(h, "h") : undefined,
             ...style,
           });
-    doc.elements.push(el);
-    added.push(el);
+    push(el);
     if (opts.label && kind !== "text") {
       const t = shapeLabel(el, opts.label, 18);
-      doc.elements.push(t);
-      added.push(t);
+      push(t);
     } else if (opts.label) {
       fail("--label is for shapes; text already carries --text", 2);
     }
@@ -1006,6 +1513,38 @@ function cmdAdd(rawArgs) {
   process.stdout.write(out.join("\n") + "\n");
 }
 
+/** Translate el by (dx,dy). Points-bearing elements keep relative geometry. */
+function translateEl(el, dx, dy) {
+  el.x += dx;
+  el.y += dy;
+  el.updated = Date.now();
+}
+
+/** Live arrows whose start+end bindings are all inside `ids` (unbound ends OK). */
+function boundFollowers(doc, ids) {
+  const set = new Set(ids);
+  return liveElements(doc).filter(
+    (e) =>
+      (e.type === "arrow" || e.type === "line") &&
+      !set.has(e.id) &&
+      (e.startBinding || e.endBinding) &&
+      ["startBinding", "endBinding"].every((k) => !e[k] || set.has(e[k].elementId))
+  );
+}
+
+/** Live arrows bound to a moved id but left behind (caller reports them). */
+function strandedArrows(doc, movedIds, followedIds) {
+  const moved = new Set(movedIds);
+  const followed = new Set(followedIds);
+  return liveElements(doc).filter(
+    (e) =>
+      (e.type === "arrow" || e.type === "line") &&
+      !moved.has(e.id) &&
+      !followed.has(e.id) &&
+      ["startBinding", "endBinding"].some((k) => e[k] && moved.has(e[k].elementId))
+  );
+}
+
 function cmdMove(rawArgs) {
   const { pos, opts } = parseArgs(rawArgs, {
     flags: [
@@ -1014,21 +1553,42 @@ function cmdMove(rawArgs) {
       { name: "dx", type: "string" },
       { name: "dy", type: "string" },
     ],
-    positional: 2,
+    positional: Infinity,
   });
   if (opts.help) return printHelp("move");
-  if (pos.length < 2) fail("move requires <file> <id>", 2, ["excalidraw-axi move <file> <id> --dx 0 --dy 60"]);
+  if (pos.length < 2) fail("move requires <file> <id...>", 2, ["excalidraw-axi move <file> <id> --dx 0 --dy 60"]);
   const { doc, abs } = loadScene(pos[0]);
-  const el = findElement(doc, pos[1]);
-  if (opts.x !== undefined) el.x = num(opts.x, "x");
-  if (opts.y !== undefined) el.y = num(opts.y, "y");
-  if (opts.dx !== undefined) el.x += num(opts.dx, "dx");
-  if (opts.dy !== undefined) el.y += num(opts.dy, "dy");
-  el.updated = Date.now();
+  const ids = pos.slice(1);
+  const els = ids.map((id) => findElement(doc, id));
+  const hasAbs = opts.x !== undefined || opts.y !== undefined;
+  const hasDelta = opts.dx !== undefined || opts.dy !== undefined;
+  if (hasAbs && (els.length > 1 || hasDelta))
+    fail("--x/--y positions a single element; use --dx/--dy for groups", 2);
+  if (!hasAbs && !hasDelta) fail("move needs --x/--y or --dx/--dy", 2);
+  const dx = opts.dx !== undefined ? num(opts.dx, "dx") : 0;
+  const dy = opts.dy !== undefined ? num(opts.dy, "dy") : 0;
+  for (const el of els) {
+    if (hasAbs) {
+      if (opts.x !== undefined) el.x = num(opts.x, "x");
+      if (opts.y !== undefined) el.y = num(opts.y, "y");
+    } else {
+      translateEl(el, dx, dy);
+    }
+    el.updated = Date.now();
+  }
+  // Arrows bound on every bound end to the moved set follow along.
+  const followed = hasAbs ? [] : boundFollowers(doc, ids);
+  for (const a of followed) translateEl(a, dx, dy);
   saveScene(abs, doc);
-  process.stdout.write(
-    [`moved: ${el.id} -> x=${el.x}, y=${el.y}`, `(attached arrows do not follow — re-add them if needed)`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
-  );
+  const out = [
+    `moved: ${els.length} element${els.length === 1 ? "" : "s"}` +
+      (followed.length ? ` (+${followed.length} bound arrow${followed.length === 1 ? "" : "s"} followed)` : ""),
+  ];
+  const stranded = strandedArrows(doc, ids, followed.map((a) => a.id));
+  if (stranded.length)
+    out.push(`(left behind: ${stranded.length} arrow${stranded.length === 1 ? "" : "s"} bound to moved shapes — re-add them: ${stranded.slice(0, 3).map((a) => a.id).join(",")}${stranded.length > 3 ? "…" : ""})`);
+  out.push(helpLines([`excalidraw-axi view ${pos[0]}`]));
+  process.stdout.write(out.join("\n") + "\n");
 }
 
 function cmdDelete(rawArgs) {
@@ -1051,6 +1611,292 @@ function cmdDelete(rawArgs) {
   );
 }
 
+// ---------- arrange ops ----------
+function resolveIds(doc, ids) {
+  return ids.map((id) => findElement(doc, id));
+}
+
+function cmdGroup(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, { flags: [], positional: Infinity });
+  if (opts.help) return printHelp("group");
+  if (pos.length < 3) fail("group requires <file> <id...>", 2, ["excalidraw-axi group <file> <id1> <id2>"]);
+  const { doc, abs } = loadScene(pos[0]);
+  const els = resolveIds(doc, pos.slice(1));
+  const gid = nid();
+  for (const el of els) {
+    el.groupIds = [...(el.groupIds || []), gid];
+    el.updated = Date.now();
+  }
+  saveScene(abs, doc);
+  process.stdout.write(
+    [`grouped: ${els.length} elements -> group ${gid}`, helpLines([`excalidraw-axi ungroup ${pos[0]} ${gid}`])].join("\n") + "\n"
+  );
+}
+
+function cmdUngroup(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, { flags: [], positional: 2 });
+  if (opts.help) return printHelp("ungroup");
+  if (pos.length < 2) fail("ungroup requires <file> <group-id>", 2);
+  const { doc, abs } = loadScene(pos[0]);
+  let n = 0;
+  for (const el of liveElements(doc)) {
+    if (el.groupIds && el.groupIds.includes(pos[1])) {
+      el.groupIds = el.groupIds.filter((g) => g !== pos[1]);
+      el.updated = Date.now();
+      n++;
+    }
+  }
+  if (!n) fail(`group not found: ${pos[1]}`, 1, [`excalidraw-axi get ${pos[0]} <id>`]);
+  saveScene(abs, doc);
+  process.stdout.write(
+    [`ungrouped: ${pos[1]} (${n} elements)`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
+  );
+}
+
+function selBox(els) {
+  const x0 = Math.min(...els.map((e) => e.x));
+  const y0 = Math.min(...els.map((e) => e.y));
+  const x1 = Math.max(...els.map((e) => e.x + (e.width || 0)));
+  const y1 = Math.max(...els.map((e) => e.y + (e.height || 0)));
+  return { x0, y0, x1, y1, w: x1 - x0, h: y1 - y0 };
+}
+
+const ALIGN_FLAGS = ["left", "center", "right", "top", "middle", "bottom"].map((n) => ({ name: n, type: "boolean" }));
+
+function cmdAlign(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, { flags: ALIGN_FLAGS, positional: Infinity });
+  if (opts.help) return printHelp("align");
+  if (pos.length < 3) fail("align requires <file> <id...> (2+)", 2);
+  const modes = ALIGN_FLAGS.map((f) => f.name).filter((n) => opts[n]);
+  if (modes.length !== 1) fail("align needs exactly one of --left|--center|--right|--top|--middle|--bottom", 2);
+  const mode = modes[0];
+  const { doc, abs } = loadScene(pos[0]);
+  const els = resolveIds(doc, pos.slice(1));
+  const box = selBox(els);
+  for (const el of els) {
+    if (mode === "left") el.x = box.x0;
+    else if (mode === "center") el.x = Math.round(box.x0 + (box.w - (el.width || 0)) / 2);
+    else if (mode === "right") el.x = Math.round(box.x1 - (el.width || 0));
+    else if (mode === "top") el.y = box.y0;
+    else if (mode === "middle") el.y = Math.round(box.y0 + (box.h - (el.height || 0)) / 2);
+    else if (mode === "bottom") el.y = Math.round(box.y1 - (el.height || 0));
+    el.updated = Date.now();
+  }
+  saveScene(abs, doc);
+  const out = [`aligned: ${els.length} elements --${mode}`];
+  const stranded = strandedArrows(doc, els.map((e) => e.id), []);
+  if (stranded.length)
+    out.push(`(left behind: ${stranded.length} bound arrows — re-add them)`);
+  out.push(helpLines([`excalidraw-axi view ${pos[0]}`]));
+  process.stdout.write(out.join("\n") + "\n");
+}
+
+function cmdDistribute(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "horizontal", type: "boolean" },
+      { name: "vertical", type: "boolean" },
+    ],
+    positional: Infinity,
+  });
+  if (opts.help) return printHelp("distribute");
+  if (pos.length < 4) fail("distribute requires <file> <id...> (3+)", 2);
+  if (!!opts.horizontal === !!opts.vertical)
+    fail("distribute needs exactly one of --horizontal|--vertical", 2);
+  const { doc, abs } = loadScene(pos[0]);
+  const els = resolveIds(doc, pos.slice(1));
+  const horiz = !!opts.horizontal;
+  const sorted = [...els].sort((a, b) => (horiz ? a.x - b.x : a.y - b.y));
+  const size = (e) => (horiz ? e.width || 0 : e.height || 0);
+  const start = (e) => (horiz ? e.x : e.y);
+  const first = start(sorted[0]);
+  const last = start(sorted[sorted.length - 1]) + size(sorted[sorted.length - 1]);
+  const total = sorted.reduce((s, e) => s + size(e), 0);
+  const gap = (last - first - total) / (sorted.length - 1);
+  if (gap < 0) fail("distribute: elements overlap along the axis — spread them first", 1);
+  let cursor = first;
+  for (const el of sorted) {
+    if (horiz) el.x = Math.round(cursor);
+    else el.y = Math.round(cursor);
+    el.updated = Date.now();
+    cursor += size(el) + gap;
+  }
+  saveScene(abs, doc);
+  process.stdout.write(
+    [`distributed: ${els.length} elements (${horiz ? "horizontal" : "vertical"}, gap ${Math.round(gap)})`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
+  );
+}
+
+function cmdFlip(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "horizontal", type: "boolean" },
+      { name: "vertical", type: "boolean" },
+    ],
+    positional: Infinity,
+  });
+  if (opts.help) return printHelp("flip");
+  if (pos.length < 3) fail("flip requires <file> <id...> (1+)", 2);
+  if (!!opts.horizontal === !!opts.vertical)
+    fail("flip needs exactly one of --horizontal|--vertical", 2);
+  const { doc, abs } = loadScene(pos[0]);
+  const els = resolveIds(doc, pos.slice(1));
+  const box = selBox(els);
+  const cx = box.x0 + box.w / 2;
+  const cy = box.y0 + box.h / 2;
+  const horiz = !!opts.horizontal;
+  for (const el of els) {
+    if (horiz) {
+      el.x = Math.round(2 * cx - el.x - (el.width || 0));
+      if (Array.isArray(el.points)) el.points = el.points.map(([px, py]) => [(el.width || 0) - px, py]);
+      if (el.type !== "text") el.angle = -(el.angle || 0);
+    } else {
+      el.y = Math.round(2 * cy - el.y - (el.height || 0));
+      if (Array.isArray(el.points)) el.points = el.points.map(([px, py]) => [px, (el.height || 0) - py]);
+      if (el.type !== "text") el.angle = -(el.angle || 0);
+    }
+    el.updated = Date.now();
+  }
+  saveScene(abs, doc);
+  process.stdout.write(
+    [`flipped: ${els.length} elements (${horiz ? "horizontal" : "vertical"})`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
+  );
+}
+
+function cmdDuplicate(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "dx", type: "string" },
+      { name: "dy", type: "string" },
+    ],
+    positional: Infinity,
+  });
+  if (opts.help) return printHelp("duplicate");
+  if (pos.length < 2) fail("duplicate requires <file> <id...>", 2);
+  const { doc, abs } = loadScene(pos[0]);
+  const els = resolveIds(doc, pos.slice(1));
+  const dx = opts.dx !== undefined ? num(opts.dx, "dx") : 20;
+  const dy = opts.dy !== undefined ? num(opts.dy, "dy") : 20;
+  const srcIds = new Set(els.map((e) => e.id));
+  const remap = new Map(els.map((e) => [e.id, nid()]));
+  const clones = els.map((el) => {
+    const c = JSON.parse(JSON.stringify(el));
+    c.id = remap.get(el.id);
+    c.seed = randomInt(0, 2 ** 31);
+    c.versionNonce = randomInt(0, 2 ** 31);
+    c.version = 1;
+    c.updated = Date.now();
+    c.isDeleted = false;
+    c.x += dx;
+    c.y += dy;
+    // rebind inside the duplicated set, drop dangling refs outside it
+    for (const k of ["startBinding", "endBinding"])
+      if (c[k]) c[k] = srcIds.has(c[k].elementId) ? { ...c[k], elementId: remap.get(c[k].elementId) } : null;
+    if (Array.isArray(c.boundElements))
+      c.boundElements = c.boundElements
+        .filter((b) => !b.id || srcIds.has(b.id))
+        .map((b) => ({ ...b, id: remap.get(b.id) ?? b.id }));
+    return c;
+  });
+  doc.elements.push(...clones);
+  saveScene(abs, doc);
+  process.stdout.write(
+    [
+      `duplicated[${clones.length}]{id}:`,
+      ...clones.map((e) => `  ${e.id}`),
+      helpLines([`excalidraw-axi view ${pos[0]}`]),
+    ].join("\n") + "\n"
+  );
+}
+
+function cmdLock(rawArgs, lock) {
+  const { pos, opts } = parseArgs(rawArgs, { flags: [], positional: Infinity });
+  const name = lock ? "lock" : "unlock";
+  if (opts.help) return printHelp(name);
+  if (pos.length < 2) fail(`${name} requires <file> <id...>`, 2);
+  const { doc, abs } = loadScene(pos[0]);
+  const els = resolveIds(doc, pos.slice(1));
+  for (const el of els) {
+    el.locked = lock;
+    el.updated = Date.now();
+  }
+  saveScene(abs, doc);
+  process.stdout.write(
+    [`${name}ed: ${els.length} elements`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
+  );
+}
+
+function cmdLink(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "url", type: "string" },
+      { name: "remove", type: "boolean" },
+    ],
+    positional: 2,
+  });
+  if (opts.help) return printHelp("link");
+  if (pos.length < 2) fail("link requires <file> <id>", 2);
+  if (!!opts.url === !!opts.remove) fail("link needs exactly one of --url <https://...> | --remove", 2);
+  const { doc, abs } = loadScene(pos[0]);
+  const el = findElement(doc, pos[1]);
+  if (opts.remove) {
+    el.link = null;
+  } else {
+    if (!isHttpUrl(opts.url)) fail(`--url must be an http(s) URL, got ${JSON.stringify(opts.url)}`, 2);
+    el.link = opts.url;
+  }
+  el.updated = Date.now();
+  saveScene(abs, doc);
+  process.stdout.write(
+    [`linked: ${el.id} -> ${el.link === null ? "(removed)" : el.link}`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
+  );
+}
+
+function cmdOrder(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "front", type: "boolean" },
+      { name: "back", type: "boolean" },
+      { name: "forward", type: "boolean" },
+      { name: "backward", type: "boolean" },
+    ],
+    positional: Infinity,
+  });
+  if (opts.help) return printHelp("order");
+  if (pos.length < 2) fail("order requires <file> <id...>", 2);
+  const modes = ["front", "back", "forward", "backward"].filter((m) => opts[m]);
+  if (modes.length !== 1) fail("order needs exactly one of --front|--back|--forward|--backward", 2);
+  const mode = modes[0];
+  const { doc, abs } = loadScene(pos[0]);
+  const sel = new Set(resolveIds(doc, pos.slice(1)).map((e) => e.id));
+  const els = doc.elements;
+  if (mode === "front") {
+    const keep = els.filter((e) => !sel.has(e.id));
+    const move = els.filter((e) => sel.has(e.id));
+    doc.elements = [...keep, ...move];
+  } else if (mode === "back") {
+    const keep = els.filter((e) => !sel.has(e.id));
+    const move = els.filter((e) => sel.has(e.id));
+    doc.elements = [...move, ...keep];
+  } else if (mode === "forward") {
+    for (let i = els.length - 2; i >= 0; i--) {
+      if (sel.has(els[i].id) && !sel.has(els[i + 1].id)) {
+        [els[i], els[i + 1]] = [els[i + 1], els[i]];
+      }
+    }
+  } else {
+    for (let i = 1; i < els.length; i++) {
+      if (sel.has(els[i].id) && !sel.has(els[i - 1].id)) {
+        [els[i], els[i - 1]] = [els[i - 1], els[i]];
+      }
+    }
+  }
+  saveScene(abs, doc);
+  process.stdout.write(
+    [`ordered: ${sel.size} elements --${mode}`, helpLines([`excalidraw-axi view ${pos[0]}`])].join("\n") + "\n"
+  );
+}
+
 function cmdClear(rawArgs) {
   const { pos, opts } = parseArgs(rawArgs, { flags: [], positional: 1 });
   if (opts.help) return printHelp("clear");
@@ -1062,6 +1908,251 @@ function cmdClear(rawArgs) {
   process.stdout.write(
     [`cleared: ${n} elements removed from ${pos[0]}`, helpLines([`excalidraw-axi add ${pos[0]} rectangle --label "Start"`])].join("\n") + "\n"
   );
+}
+
+// ---------- live instance (serve/open/sync) ----------
+// The Excalidraw web app loads external scenes via `#url=<scene-file-url>`
+// (fetch + same loader as the Open dialog). The CLI serves the file with
+// CORS headers so a tab at --url can fetch it from 127.0.0.1:<port>.
+const SERVE_DEFAULT_PORT = 5237;
+
+function stripHash(u) {
+  return String(u).replace(/#.*$/, "");
+}
+
+function viewerLink(viewer, fileUrl) {
+  return `${stripHash(viewer)}#url=${encodeURIComponent(fileUrl)}`;
+}
+
+function startSceneServer(abs, port) {
+  const server = createServer((req, res) => {
+    const u = new URL(req.url || "/", "http://x");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (u.pathname === "/scene.excalidraw") {
+      let body;
+      try {
+        body = readFileSync(abs, "utf8");
+        JSON.parse(body);
+      } catch (e) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("scene unreadable");
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(body);
+      return;
+    }
+    if (u.pathname === "/") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("excalidraw-axi scene server: GET /scene.excalidraw\n");
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+  });
+  return new Promise((resolve, reject) => {
+    server.on("error", (e) => reject(e));
+    server.listen(port, "127.0.0.1", () => resolve(server));
+  });
+}
+
+async function cmdServe(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "port", type: "string" },
+      { name: "url", type: "string" },
+    ],
+    positional: 1,
+  });
+  if (opts.help) return printHelp("serve");
+  if (!pos[0]) fail("serve requires <file>", 2, ["excalidraw-axi serve <file>"]);
+  const { abs } = loadScene(pos[0]); // fail fast if unreadable
+  const port = opts.port !== undefined ? num(opts.port, "port") : SERVE_DEFAULT_PORT;
+  const viewer = opts.url || "http://localhost:5001";
+  let server;
+  try {
+    server = await startSceneServer(abs, port);
+  } catch (e) {
+    fail(`cannot serve on 127.0.0.1:${port} (${e.message})`, 1, [`excalidraw-axi serve ${pos[0]} --port <free-port>`]);
+  }
+  const link = viewerLink(viewer, `http://127.0.0.1:${port}/scene.excalidraw`);
+  process.stdout.write(
+    [
+      `serving: ${pos[0]} on http://127.0.0.1:${port}/scene.excalidraw`,
+      `open: ${link}`,
+      `(paste into your running Excalidraw tab — click Load if it asks to replace the canvas)`,
+      helpLines([`excalidraw-axi open ${pos[0]}`, `excalidraw-axi sync ${pos[0]}`]),
+    ].join("\n") + "\n"
+  );
+  void server;
+  await new Promise(() => {}); // serve until Ctrl+C
+}
+
+async function cmdOpen(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "port", type: "string" },
+      { name: "url", type: "string" },
+      { name: "no-launch", type: "boolean" },
+    ],
+    positional: 1,
+  });
+  if (opts.help) return printHelp("open");
+  if (!pos[0]) fail("open requires <file>", 2, ["excalidraw-axi open <file>"]);
+  const { abs } = loadScene(pos[0]);
+  const port = opts.port !== undefined ? num(opts.port, "port") : SERVE_DEFAULT_PORT;
+  const viewer = opts.url || "http://localhost:5001";
+  let server;
+  try {
+    server = await startSceneServer(abs, port);
+  } catch (e) {
+    fail(`cannot serve on 127.0.0.1:${port} (${e.message})`, 1, [`excalidraw-axi open ${pos[0]} --port <free-port>`]);
+  }
+  const link = viewerLink(viewer, `http://127.0.0.1:${port}/scene.excalidraw`);
+  const out = [
+    `serving: ${pos[0]} on http://127.0.0.1:${port}/scene.excalidraw`,
+    `open: ${link}`,
+  ];
+  if (!opts["no-launch"]) {
+    const opener = platform() === "darwin" ? "open" : platform() === "win32" ? "start" : "xdg-open";
+    const r = spawnSync(opener, [link], { stdio: "ignore" });
+    out.push(r.error || r.status !== 0 ? `(browser launch failed — paste the open: URL manually)` : `launched: browser`);
+  }
+  out.push(`(click Load in the tab if it asks to replace the canvas)`);
+  out.push(helpLines([`excalidraw-axi sync ${pos[0]}`]));
+  process.stdout.write(out.join("\n") + "\n");
+  void server;
+  await new Promise(() => {}); // serve until Ctrl+C
+}
+
+function runHelper(args) {
+  const r = spawnSync("chrome-devtools-axi", args, { encoding: "utf8" });
+  if (r.error) return { ok: false, out: r.error.message };
+  return { ok: r.status === 0, out: String(r.stdout || "") + String(r.stderr || "") };
+}
+
+function helperResult(out) {
+  const m = String(out).split("\n").find((l) => l.startsWith("result: "));
+  if (!m) return undefined;
+  let v;
+  try {
+    v = JSON.parse(m.slice("result: ".length));
+  } catch {
+    return undefined;
+  }
+  // string payloads come double-encoded (result: "\"...\"") — unwrap them
+  for (let i = 0; i < 2 && typeof v === "string" && v.startsWith('"'); i++) {
+    try {
+      v = JSON.parse(v);
+    } catch {
+      break;
+    }
+  }
+  return v;
+}
+
+async function cmdSync(rawArgs) {
+  const { pos, opts } = parseArgs(rawArgs, {
+    flags: [
+      { name: "port", type: "string" },
+      { name: "url", type: "string" },
+    ],
+    positional: 1,
+  });
+  if (opts.help) return printHelp("sync");
+  if (!pos[0]) fail("sync requires <file>", 2, ["excalidraw-axi sync <file>"]);
+  const { doc, abs } = loadScene(pos[0]);
+  const want = liveElements(doc).length;
+  const probe = runHelper(["--help"]);
+  if (!probe.ok)
+    fail("sync needs the chrome-devtools-axi browser helper on PATH (it drives the check)", 1, [
+      `excalidraw-axi open ${pos[0]}   (manual: paste the open: URL into your tab)`,
+    ]);
+  const port = opts.port !== undefined ? num(opts.port, "port") : SERVE_DEFAULT_PORT;
+  const viewer = opts.url || "http://localhost:5001";
+  const link = viewerLink(viewer, `http://127.0.0.1:${port}/scene.excalidraw`);
+  // The scene server must live in its own process: spawnSync blocks this
+  // process's event loop, so an in-process server could never answer the
+  // tab's fetch while a helper command runs. Reuse `serve` detached.
+  const child = spawn(process.execPath, [process.argv[1], "serve", abs, "--port", String(port)], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  const killServer = () => {
+    try {
+      child.kill();
+    } catch {}
+  };
+  process.on("SIGINT", () => {
+    killServer();
+    process.exit(130);
+  });
+  let ready = false;
+  for (let i = 0; i < 40 && !ready; i++) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/`);
+      if (r.ok) {
+        ready = true;
+        try {
+          await r.text();
+        } catch {}
+      }
+    } catch {}
+    if (!ready) await new Promise((r) => setTimeout(r, 250));
+  }
+  const done = (code) => {
+    killServer();
+    process.exit(code);
+  };
+  if (!ready) {
+    process.stdout.write(
+      `error: cannot serve on 127.0.0.1:${port} (still busy after 10s — is another serve running?)\n`
+    );
+    done(1);
+  }
+  const step = (args, what) => {
+    const r = runHelper(args);
+    if (!r.ok) {
+      process.stdout.write(`error: sync failed at ${what} (browser helper error)\n`);
+      done(1);
+    }
+    return r.out;
+  };
+  // Start from a blank canvas so the app loads without a confirm dialog.
+  step(["open", stripHash(viewer)], "open viewer");
+  const cleared = helperResult(step(["eval", '() => { localStorage.setItem("excalidraw", "[]"); return "cleared"; }'], "clear canvas"));
+  if (cleared !== "cleared") {
+    process.stdout.write(`error: sync failed (could not clear canvas)\n`);
+    done(1);
+  }
+  step(["open", link], "open scene link");
+  // Poll: the app fetches + renders async, then persists to localStorage.
+  let got;
+  for (let i = 0; i < 6; i++) {
+    step(["wait", "2000"], "wait");
+    const out = step(["eval", '() => JSON.parse(localStorage.getItem("excalidraw")).length'], "read canvas");
+    got = Number(helperResult(out));
+    if (got === want) break;
+  }
+  if (got === want) {
+    process.stdout.write(
+      [`synced: ${got} elements -> ${stripHash(viewer)}`, helpLines([`excalidraw-axi export ${pos[0]} --svg`])].join("\n") + "\n"
+    );
+    done(0);
+  }
+  process.stdout.write(
+    [
+      `error: sync unverified (canvas has ${Number.isFinite(got) ? got : "?"}, file has ${want})`,
+      `(the tab may be showing a confirm dialog — accept it and re-run sync)`,
+    ].join("\n") + "\n"
+  );
+  done(1);
 }
 
 function cmdExport(rawArgs) {
@@ -1103,31 +2194,54 @@ function printHelp(topic) {
       "",
       "Draw:",
       '  create --spec d.json -o s.excalidraw  Boxes+edges with auto-layout (row|column|grid)',
-      "  create --mermaid-file f.mmd -o s.excalidraw  Flowchart/graph (TD,TB,LR,RL,BT)",
+      "  create --mermaid-file f.mmd -o s.excalidraw  Flowchart/graph or sequenceDiagram",
       '  create -o s.excalidraw --title "T"  Blank title template',
       '  add <file> rectangle|ellipse|diamond --label "API" [--x N --y N --w N --h N]',
       '  add <file> text --text "Hi" [--x N --y N --font-size 20]',
       "  add <file> arrow|line --from <id> --to <id> [--label \"calls\"]",
-      "  add <file> arrow --x1 N --y1 N --x2 N --y2 N | --points \"x1,y1 x2,y2\"",
+      "  add <file> arrow --x1 N --y1 N --x2 N --y2 N | --points \"x1,y1 x2,y2 ...\"",
+      '  add <file> freedraw --points "x1,y1 x2,y2 ..."',
+      '  add <file> frame --label "F" | image --file a.png | embed --link <url>',
+      "  style: --stroke #hex --background #hex --stroke-width N --stroke-style solid|dashed|dotted",
+      "    --fill-style solid|hachure|cross-hatch|dots|zigzag --roundness sharp|round --angle N",
+      "    --roughness 0..2 --opacity 0..100 --font-family 1..5 --text-align left|center|right",
+      "    --locked --link <url> --frame <frame-id> --arrow-type sharp|round",
       "",
-      "Inspect / edit:",
+      "Arrange:",
+      "  move <file> <id...> --dx N --dy N | --x N --y N (single)",
+      "  group <file> <id...> | ungroup <file> <group-id>",
+      "  align <file> <id...> --left|--center|--right|--top|--middle|--bottom",
+      "  distribute <file> <id...> --horizontal|--vertical",
+      "  flip <file> <id...> --horizontal|--vertical",
+      "  duplicate <file> <id...> [--dx N --dy N]",
+      "  lock|unlock <file> <id...>",
+      "  link <file> <id> --url <https://...> | --remove",
+      "  order <file> <id...> --front|--back|--forward|--backward",
+      "  delete <file> <id...>      Soft-delete (isDeleted)",
+      "  clear <file>               Remove all elements",
+      "",
+      "Live instance:",
+      "  serve <file> [--port N] [--url U]   Scene file over CORS localhost server",
+      "  open <file> [--port N] [--url U] [--no-launch]  Serve + open #url= link",
+      "  sync <file> [--port N] [--url U]    Serve + verify via browser helper",
+      "",
+      "Inspect / render:",
       "  list [dir]                 List scenes",
       "  view <file> [--full]       Summary (truncated unless --full)",
       "  get <file> <id> [--full]   One element as JSON",
-      "  validate <file>            Schema check (exit 1 if invalid)",
-      "  move <file> <id> --x N --y N | --dx N --dy N",
-      "  delete <file> <id...>      Soft-delete (isDeleted)",
-      "  clear <file>               Remove all elements",
+      "  validate <file>            Schema + integrity check (exit 1 if invalid)",
       "  export <file> [--svg] [-o out] [--scale N]",
       "",
       "Global: --help, --version. Unknown flags fail loud (exit 2).",
-      "Note: move does not drag attached arrows — re-add them if needed.",
+      "Notes: move drags arrows bound on every end to the moved set; partially",
+      "  bound arrows are reported left-behind. Embeds render inline only for",
+      "  allowlisted hosts (youtube/vimeo/codesandbox/...). No sticky/laser/AI ops.",
     ].join("\n"),
     list: "Usage: excalidraw-axi list [dir]\n\nList .excalidraw scenes with live element counts.",
     view: "Usage: excalidraw-axi view <file> [--full]\n\nShow version, element counts by type, and first 15 elements (id,type,x,y,w,h,text). Long text truncated unless --full.",
     get: "Usage: excalidraw-axi get <file> <id> [--full]\n\nPrint one element as JSON (truncated at 2000 chars unless --full).",
     validate:
-      "Usage: excalidraw-axi validate <file>\n\nCheck type/elements/required fields. Prints valid: true/false, exit 1 on invalid.",
+      "Usage: excalidraw-axi validate <file>\n\nSchema + integrity: required fields, unique ids, known types, numeric geometry, points/pressures, live bindings/fileIds/frameIds. Prints valid: true/false, exit 1 on invalid.",
     create: [
       "Usage:",
       '  excalidraw-axi create --spec diagram.json -o s.excalidraw',
@@ -1135,25 +2249,60 @@ function printHelp(topic) {
       '  excalidraw-axi create -o s.excalidraw --title "T"',
       "",
       "spec JSON: {layout: row|column|grid,",
-      '  nodes: [{id?, label, shape?: rectangle|ellipse|diamond|text, w?, h?}],',
+      '  nodes: [{id?, label, shape?: rectangle|ellipse|diamond|text, w?, h?, stroke?, background?}],',
       '  edges: [{from, to, label?}]}',
       "mermaid: flowchart/graph subset — TD,TB,LR,RL,BT; [box], (rounded),",
       "  {decision}->diamond, ((circle))->ellipse; -->/---/==>/--o/--x/-.-> edges,",
-      "  |labels| and A-->B-->C chains. Other diagram types fail with a clear error.",
+      "  |labels| and A-->B-->C chains. sequenceDiagram subset — participant/actor,",
+      "  ->/->>/-->/-->>/-x/--x messages, Note over/left of/right of. Other diagram",
+      "  types fail with a clear error.",
     ].join("\n"),
     add: [
       "Usage:",
       '  excalidraw-axi add <file> rectangle|ellipse|diamond [--x N --y N] [--w N --h N]',
       '    [--stroke #hex] [--background #hex|transparent] [--label "T"]',
-      '  excalidraw-axi add <file> text --text "Hi" [--x N --y N --font-size 20]',
+      '  excalidraw-axi add <file> text --text "Hi" [--font-size 20 --font-family 2 --text-align center]',
       '  excalidraw-axi add <file> arrow|line --from <id> --to <id> [--label "calls"]',
       "  excalidraw-axi add <file> arrow --x1 N --y1 N --x2 N --y2 N [--label T]",
-      '  excalidraw-axi add <file> arrow --points "x1,y1 x2,y2"',
+      '  excalidraw-axi add <file> arrow|line --points "x1,y1 x2,y2 x3,y3" (polyline)',
+      '  excalidraw-axi add <file> freedraw --points "x1,y1 x2,y2 ..." [--pressures "0.5 0.8 ..."]',
+      '  excalidraw-axi add <file> frame --label "F" [--x N --y N --w N --h N]',
+      "  excalidraw-axi add <file> image --file a.png [--x N --y N --w N --h N]",
+      "  excalidraw-axi add <file> embed --link <https://...> [--x N --y N --w N --h N]",
+      "",
+      "Style flags: --stroke --background/--bg --stroke-width --stroke-style",
+      "  --fill-style --roundness sharp|round --angle --roughness 0..2 --opacity 0..100",
+      "  --font-family 1..5 --text-align --locked --link <url> --frame <frame-id>",
+      "  --arrow-type sharp|round (arrows). stroke-style/fill-style/roundness apply",
+      "  to shapes+edges (text keeps stroke/font/align/link/lock only).",
       "",
       "No --x/--y: auto-places below existing content. --from/--to binds the arrow",
       "to both shapes (recorded in boundElements). Labels are midpoint/unbound text.",
+      "image embeds the raster as dataURL in files[]. embed renders inline only on",
+      "allowlisted hosts. No sticky type in OSS Excalidraw — use rectangle+text.",
     ].join("\n"),
-    move: "Usage: excalidraw-axi move <file> <id> --x N --y N | --dx N --dy N\n\nAttached arrows do not follow — re-add them if needed.",
+    move: "Usage: excalidraw-axi move <file> <id...> --dx N --dy N | (--x N --y N for one element)\n\nArrows bound on every end to the moved set follow; partially-bound arrows are reported left-behind.",
+    group: "Usage: excalidraw-axi group <file> <id...>\n\nAssign a shared groupId (appended; prints it for ungroup).",
+    ungroup: "Usage: excalidraw-axi ungroup <file> <group-id>\n\nRemove the group id from every element that has it.",
+    align:
+      "Usage: excalidraw-axi align <file> <id...> --left|--center|--right|--top|--middle|--bottom\n\nAlign 2+ elements to the selection bbox.",
+    distribute:
+      "Usage: excalidraw-axi distribute <file> <id...> --horizontal|--vertical\n\nEven gaps between 3+ non-overlapping elements.",
+    flip:
+      "Usage: excalidraw-axi flip <file> <id...> --horizontal|--vertical\n\nMirror geometry about the selection center (text keeps its angle).",
+    duplicate:
+      "Usage: excalidraw-axi duplicate <file> <id...> [--dx N --dy N]\n\nClone with fresh ids (default offset 20,20); bindings remapped inside the set.",
+    lock: "Usage: excalidraw-axi lock <file> <id...>\n\nSet locked=true.",
+    unlock: "Usage: excalidraw-axi unlock <file> <id...>\n\nSet locked=false.",
+    link: "Usage: excalidraw-axi link <file> <id> --url <https://...> | --remove\n\nSet or clear the hyperlink.",
+    order:
+      "Usage: excalidraw-axi order <file> <id...> --front|--back|--forward|--backward\n\nReorder z (elements array; front = drawn last = on top).",
+    serve:
+      "Usage: excalidraw-axi serve <file> [--port 5237] [--url http://localhost:5001]\n\nServe the scene with CORS headers; paste the printed open: #url= link into a running tab.",
+    open:
+      "Usage: excalidraw-axi open <file> [--port 5237] [--url U] [--no-launch]\n\nServe + launch the #url= link in a browser. Serves until Ctrl+C.",
+    sync:
+      "Usage: excalidraw-axi sync <file> [--port 5237] [--url U]\n\nServe + load via the chrome-devtools-axi helper and verify element count. Exits 0 on match.",
     delete:
       "Usage: excalidraw-axi delete <file> <id...>\n\nSoft-delete (sets isDeleted, Excalidraw convention).",
     clear: "Usage: excalidraw-axi clear <file>\n\nRemove all elements (keeps appState).",
@@ -1190,6 +2339,32 @@ function main() {
       return cmdAdd(rest);
     case "move":
       return cmdMove(rest);
+    case "group":
+      return cmdGroup(rest);
+    case "ungroup":
+      return cmdUngroup(rest);
+    case "align":
+      return cmdAlign(rest);
+    case "distribute":
+      return cmdDistribute(rest);
+    case "flip":
+      return cmdFlip(rest);
+    case "duplicate":
+      return cmdDuplicate(rest);
+    case "lock":
+      return cmdLock(rest, true);
+    case "unlock":
+      return cmdLock(rest, false);
+    case "link":
+      return cmdLink(rest);
+    case "order":
+      return cmdOrder(rest);
+    case "serve":
+      return cmdServe(rest);
+    case "open":
+      return cmdOpen(rest);
+    case "sync":
+      return cmdSync(rest);
     case "delete":
       return cmdDelete(rest);
     case "clear":
